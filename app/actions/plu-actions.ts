@@ -9,10 +9,12 @@ import {
   getZoneUrba,
   getParcelPolygon,
   getDvfSummaryNearby,
+  getGeorisquesNearby,
   PLUEngineError,
   type ZoneUrba,
   type ParcelPolygon,
   type DvfSummary,
+  type GeorisquesSummary,
   type AddressSuggestion,
 } from "@/src/lib/plu-engine";
 
@@ -69,6 +71,31 @@ export async function lookupDvfAction(
     }
 
     console.error("[lookupDvfAction] unexpected", err);
+    return null;
+  }
+}
+
+export async function lookupGeorisquesAction(
+  lon: number,
+  lat: number
+): Promise<GeorisquesSummary | null> {
+  try {
+    return await getGeorisquesNearby(lon, lat);
+  } catch (err) {
+    if (err instanceof TypeError) {
+      console.warn("[lookupGeorisquesAction] fetch failed", err.message);
+      return null;
+    }
+
+    if (
+      err instanceof PLUEngineError &&
+      (err.code === "TIMEOUT" || err.code === "INVALID_COORDS")
+    ) {
+      console.warn("[lookupGeorisquesAction]", err.message);
+      return null;
+    }
+
+    console.error("[lookupGeorisquesAction] unexpected", err);
     return null;
   }
 }

@@ -72,6 +72,40 @@ export interface DvfSummary {
   source: "dvf-etalab";
 }
 
+export type RiskLevel = "LOW" | "MEDIUM" | "HIGH" | "UNKNOWN";
+
+export interface GeorisquesSummary {
+  /** Inondation potentielle détectée autour du point. */
+  floodRisk: boolean;
+  /** Niveau de risque inondation. */
+  floodLevel: RiskLevel;
+  /** Exposition argile potentielle détectée autour du point. */
+  clayRisk: boolean;
+  /** Niveau de risque argile (retrait-gonflement). */
+  clayLevel: RiskLevel;
+  /** Nombre d'aléas/objets risques retournés par la source. */
+  hazardCount: number;
+  /** Source de données utilisée. */
+  source: "georisques";
+}
+
+export interface ProfitabilityScore {
+  /** Score synthétique de rentabilité (0-100). */
+  score: number;
+  /** Surface de plancher théorique (m²). */
+  theoreticalFloorAreaM2: number;
+  /** Nombre d'étages théoriques basé sur la hauteur. */
+  theoreticalLevels: number;
+  /** Emprise utilisée (0-100). */
+  coveragePct: number;
+  /** Potentiel de valorisation estimé (EUR). */
+  theoreticalValueEur: number;
+  /** Coût de construction estimé (EUR). */
+  estimatedCostEur: number;
+  /** Marge brute estimée (EUR). */
+  grossProfitEur: number;
+}
+
 export interface PLUResult {
   address: AddressSuggestion;
   zone: ZoneUrba | null;
@@ -107,13 +141,17 @@ const GPU_WFS_VERSION = "2.0.0";
 const GPU_WFS_TYPENAMES = ["wfs_du:zone_urba"] as const;
 const CADASTRE_API_URL = "https://apicarto.ign.fr/api/cadastre/parcelle";
 const DVF_API_BASE_URL = "https://app.dvf.etalab.gouv.fr/api/mutations3";
+const GEORISQUES_API_BASE_URL = "https://www.georisques.gouv.fr/api/v1";
 
 /** Délai maximum en ms avant d'abandonner une requête externe. */
 const FETCH_TIMEOUT_MS = 8_000;
 const WFS_TIMEOUT_MS = 12_000;
-const WFS_MAX_RETRIES = 2;
+const WFS_MAX_RETRIES = 3;
+const WFS_RETRY_DELAY_MS = 180;
 const DVF_TIMEOUT_MS = 10_000;
 const DVF_MAX_RETRIES = 1;
+const GEORISQUES_TIMEOUT_MS = 7_000;
+const GEORISQUES_MAX_RETRIES = 2;
 const EARTH_RADIUS_M = 6_378_137;
 
 // ─── Utilitaire interne ───────────────────────────────────────────────────────
@@ -206,6 +244,168 @@ function median(values: number[]): number | null {
     return (sorted[mid - 1] + sorted[mid]) / 2;
   }
   return sorted[mid];
+}
+
+function normalizeText(value: string): string {
+  return value
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+}
+
+function riskLevelRank(level: RiskLevel): number {
+  if (level === "HIGH") return 3;
+  if (level === "MEDIUM") return 2;
+  if (level === "LOW") return 1;
+  return 0;
+}
+
+function maxRiskLevel(a: RiskLevel, b: RiskLevel): RiskLevel {
+  return riskLevelRank(a) >= riskLevelRank(b) ? a : b;
+}
+
+function parseRiskLevel(value: unknown): RiskLevel {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    if (value >= 3) return "HIGH";
+    if (value >= 2) return "MEDIUM";
+    if (value >= 1) return "LOW";
+    return "UNKNOWN";
+  }
+
+  if (typeof value !== "string") return "UNKNOWN";
+  const normalized = normalizeText(value.trim());
+  if (!normalized) return "UNKNOWN";
+
+  if (
+    normalized.includes("fort") ||
+    normalized.includes("eleve") ||
+    normalized.includes("high") ||
+    normalized === "3"
+  ) {
+    return "HIGH";
+  }
+  if (
+    normalized.includes("moyen") ||
+    normalized.includes("modere") ||
+    normalized.includes("medium") ||
+    normalized === "2"
+  ) {
+    return "MEDIUM";
+  }
+  if (
+    normalized.includes("faible") ||
+    normalized.includes("bas") ||
+    normalized.includes("low") ||
+    normalized === "1"
+  ) {
+    return "LOW";
+  }
+
+  return "UNKNOWN";
+}
+
+function detectKeywordPresence(data: unknown, keywords: string[]): boolean {
+  if (!data || typeof data !== "object") return false;
+  const payload = normalizeText(JSON.stringify(data));
+  return keywords.some((keyword) => payload.includes(normalizeText(keyword)));
+}
+
+function detectHazardCount(data: unknown): number {
+  if (!data || typeof data !== "object") return 0;
+  const root = data as Record<string, unknown>;
+  const keys = ["data", "items", "features", "resultats", "results"] as const;
+
+  for (const key of keys) {
+    const value = root[key];
+    if (Array.isArray(value)) return value.length;
+  }
+  return 0;
+}
+
+function detectRiskLevelFromData(data: unknown, keys: string[]): RiskLevel {
+  if (!data || typeof data !== "object") return "UNKNOWN";
+  const root = data as Record<string, unknown>;
+  let bestLevel: RiskLevel = "UNKNOWN";
+
+  for (const key of keys) {
+    const parsed = parseRiskLevel(root[key]);
+    bestLevel = maxRiskLevel(bestLevel, parsed);
+  }
+
+  const listKeys = ["data", "items", "features", "resultats", "results"] as const;
+  for (const listKey of listKeys) {
+    const value = root[listKey];
+    if (!Array.isArray(value)) continue;
+    for (const row of value) {
+      if (!row || typeof row !== "object") continue;
+      const record = row as Record<string, unknown>;
+      for (const key of keys) {
+        bestLevel = maxRiskLevel(bestLevel, parseRiskLevel(record[key]));
+      }
+      const props = record.properties;
+      if (props && typeof props === "object") {
+        const propRecord = props as Record<string, unknown>;
+        for (const key of keys) {
+          bestLevel = maxRiskLevel(bestLevel, parseRiskLevel(propRecord[key]));
+        }
+      }
+    }
+  }
+
+  return bestLevel;
+}
+
+/**
+ * Score de rentabilité simplifié: compare le potentiel constructible théorique
+ * à la valeur médiane DVF du secteur.
+ */
+export function computeProfitabilityScore(params: {
+  parcelAreaM2?: number | null;
+  coveragePct?: number | null;
+  maxHeightM?: number | null;
+  medianDvfValueEur?: number | null;
+}): ProfitabilityScore | null {
+  const parcelAreaM2 = params.parcelAreaM2 ?? null;
+  const coveragePct = params.coveragePct ?? 50;
+  const maxHeightM = params.maxHeightM ?? null;
+  const medianDvfValueEur = params.medianDvfValueEur ?? null;
+
+  if (
+    !parcelAreaM2 ||
+    parcelAreaM2 <= 0 ||
+    !medianDvfValueEur ||
+    medianDvfValueEur <= 0
+  ) {
+    return null;
+  }
+
+  const clampedCoveragePct = Math.min(95, Math.max(15, coveragePct));
+  const theoreticalLevels = Math.max(
+    1,
+    Math.min(10, Math.floor((maxHeightM && maxHeightM > 0 ? maxHeightM : 12) / 3))
+  );
+  const footprintM2 = parcelAreaM2 * (clampedCoveragePct / 100);
+  const theoreticalFloorAreaM2 = footprintM2 * theoreticalLevels;
+
+  // Proxy local: valeur DVF médiane rapportée à la surface parcellaire.
+  const localPricePerM2 = medianDvfValueEur / parcelAreaM2;
+  const theoreticalValueEur = theoreticalFloorAreaM2 * localPricePerM2;
+  const constructionCostPerM2 = localPricePerM2 * 0.62 + 750;
+  const estimatedCostEur = theoreticalFloorAreaM2 * constructionCostPerM2;
+  const grossProfitEur = theoreticalValueEur - estimatedCostEur;
+
+  const marginRatio = theoreticalValueEur > 0 ? grossProfitEur / theoreticalValueEur : 0;
+  const score = Math.round(Math.min(100, Math.max(0, (marginRatio + 0.2) * 125)));
+
+  return {
+    score,
+    theoreticalFloorAreaM2,
+    theoreticalLevels,
+    coveragePct: clampedCoveragePct,
+    theoreticalValueEur,
+    estimatedCostEur,
+    grossProfitEur,
+  };
 }
 
 async function fetchJsonWithRetry(
@@ -362,10 +562,12 @@ export async function getZoneUrba(
   }
 
   let lastError: unknown = null;
+  let lastFailedWfsUrl: string | null = null;
 
   for (const typeName of GPU_WFS_TYPENAMES) {
     const requestUrl = buildZoneWfsUrl(typeName, lon, lat);
     console.log(`[plu-engine][getZoneUrba] WFS URL: ${requestUrl}`);
+    lastFailedWfsUrl = requestUrl;
 
     for (let attempt = 0; attempt <= WFS_MAX_RETRIES; attempt += 1) {
       try {
@@ -373,7 +575,7 @@ export async function getZoneUrba(
 
         if (!res.ok) {
           if (attempt < WFS_MAX_RETRIES && (res.status >= 500 || res.status === 429)) {
-            await delay(400 * (attempt + 1));
+            await delay(WFS_RETRY_DELAY_MS * (attempt + 1));
             continue;
           }
           throw new PLUEngineError(
@@ -427,7 +629,7 @@ export async function getZoneUrba(
         const hasRetry = attempt < WFS_MAX_RETRIES;
 
         if ((isTimeout || isNetworkError) && hasRetry) {
-          await delay(400 * (attempt + 1));
+          await delay(WFS_RETRY_DELAY_MS * (attempt + 1));
           continue;
         }
         break;
@@ -439,10 +641,22 @@ export async function getZoneUrba(
     throw lastError;
   }
   if (lastError && isNetworkFetchError(lastError)) {
+    if (lastFailedWfsUrl) {
+      console.error(
+        `[plu-engine][getZoneUrba] Echec WFS (URL testable): ${lastFailedWfsUrl}`,
+        lastError
+      );
+    }
     const detail = lastError instanceof Error ? lastError.message : "fetch failed";
     throw new PLUEngineError(`Erreur réseau GPU WFS (${detail})`, "WFS_FAILED");
   }
   if (lastError) {
+    if (lastFailedWfsUrl) {
+      console.error(
+        `[plu-engine][getZoneUrba] Echec WFS (URL testable): ${lastFailedWfsUrl}`,
+        lastError
+      );
+    }
     throw new PLUEngineError("Erreur inconnue lors de l'appel au GPU WFS.", "WFS_FAILED");
   }
 
@@ -602,6 +816,112 @@ export async function getDvfSummaryNearby(
     averageValueEur: avg,
     latestMutationDate,
     source: "dvf-etalab",
+  };
+}
+
+/**
+ * Récupère un résumé "Sécurité & Risques" autour d'un point.
+ *
+ * Note: la structure de réponse Georisques peut varier selon les endpoints.
+ * On applique donc un parsing défensif pour extraire inondation + argile.
+ */
+export async function getGeorisquesNearby(
+  lon: number,
+  lat: number
+): Promise<GeorisquesSummary | null> {
+  if (!isFinite(lon) || !isFinite(lat)) {
+    throw new PLUEngineError(
+      `Coordonnées invalides : lon=${lon}, lat=${lat}`,
+      "INVALID_COORDS"
+    );
+  }
+
+  const candidateUrls = [
+    `${GEORISQUES_API_BASE_URL}/rapport_risque?latlon=${lat},${lon}`,
+    `${GEORISQUES_API_BASE_URL}/resultats_rapport_risque?latlon=${lat},${lon}`,
+    `${GEORISQUES_API_BASE_URL}/retrait-gonflement-argiles?latlon=${lat},${lon}`,
+  ];
+
+  let lastError: unknown = null;
+  let floodLevel: RiskLevel = "UNKNOWN";
+  let clayLevel: RiskLevel = "UNKNOWN";
+  let floodRisk = false;
+  let clayRisk = false;
+  let hazardCount = 0;
+  let successfulCalls = 0;
+
+  for (const url of candidateUrls) {
+    console.log(`[plu-engine][getGeorisquesNearby] Georisques URL: ${url}`);
+    try {
+      const json = await fetchJsonWithRetry(
+        url,
+        GEORISQUES_TIMEOUT_MS,
+        GEORISQUES_MAX_RETRIES
+      );
+      successfulCalls += 1;
+      hazardCount += detectHazardCount(json);
+
+      const hasFlood = detectKeywordPresence(json, [
+        "inondation",
+        "inonde",
+        "crue",
+        "submersion",
+      ]);
+      const hasClay = detectKeywordPresence(json, [
+        "argile",
+        "retrait-gonflement",
+        "gonflement",
+        "rga",
+      ]);
+
+      const detectedFloodLevel = detectRiskLevelFromData(json, [
+        "niveau_inondation",
+        "risque_inondation",
+        "inondation_niveau",
+        "inondation",
+      ]);
+      const detectedClayLevel = detectRiskLevelFromData(json, [
+        "niveau_argile",
+        "risque_argile",
+        "exposition_argile",
+        "retrait_gonflement_argile",
+        "argile",
+      ]);
+
+      floodRisk = floodRisk || hasFlood;
+      clayRisk = clayRisk || hasClay;
+      floodLevel = maxRiskLevel(floodLevel, detectedFloodLevel);
+      clayLevel = maxRiskLevel(clayLevel, detectedClayLevel);
+    } catch (error) {
+      lastError = error;
+      console.error(`[plu-engine][getGeorisquesNearby] Echec URL: ${url}`, error);
+    }
+  }
+
+  if (successfulCalls === 0 && lastError && isNetworkFetchError(lastError)) {
+    return null;
+  }
+
+  if (floodLevel === "UNKNOWN" && floodRisk) {
+    floodLevel = "MEDIUM";
+  }
+  if (clayLevel === "UNKNOWN" && clayRisk) {
+    clayLevel = "MEDIUM";
+  }
+  if (!floodRisk && floodLevel === "UNKNOWN") {
+    floodLevel = "LOW";
+  }
+  if (!clayRisk && clayLevel === "UNKNOWN") {
+    clayLevel = "LOW";
+  }
+
+  return {
+    floodRisk,
+    floodLevel,
+    clayRisk,
+    clayLevel,
+    hazardCount,
+    source: "georisques",
   };
 }
 

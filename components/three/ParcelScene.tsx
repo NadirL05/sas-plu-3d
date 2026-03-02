@@ -2,7 +2,13 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Canvas, useThree } from "@react-three/fiber";
-import { ContactShadows, Grid, OrbitControls } from "@react-three/drei";
+import {
+  ContactShadows,
+  Environment,
+  Grid,
+  OrbitControls,
+  SoftShadows,
+} from "@react-three/drei";
 import { gsap } from "gsap";
 import * as THREE from "three";
 import type { OrbitControls as OrbitControlsImpl } from "three-stdlib";
@@ -299,6 +305,30 @@ function getParcelGeometryToken(geometry?: ParcelGeometry): string | null {
   return `M:${multiPolygon.length}:${firstLon}:${firstLat}`;
 }
 
+interface SunSettings {
+  position: [number, number, number];
+  intensity: number;
+  shadowOpacity: number;
+}
+
+function getSunSettings(sunTime: number, center: THREE.Vector3): SunSettings {
+  const clampedTime = Math.min(20, Math.max(6, sunTime));
+  const dayProgress = (clampedTime - 6) / 14;
+  const altitudeFactor = Math.max(0.12, Math.sin(dayProgress * Math.PI));
+  const azimuth = THREE.MathUtils.lerp(-Math.PI * 0.65, Math.PI * 0.65, dayProgress);
+  const radius = 26;
+
+  return {
+    position: [
+      center.x + Math.cos(azimuth) * radius,
+      THREE.MathUtils.lerp(6, 24, altitudeFactor),
+      center.z + Math.sin(azimuth) * radius,
+    ],
+    intensity: THREE.MathUtils.lerp(0.42, 1.35, altitudeFactor),
+    shadowOpacity: THREE.MathUtils.lerp(0.68, 0.35, altitudeFactor),
+  };
+}
+
 function useExtrudedGeometry(shapes: THREE.Shape[], height: number): THREE.ExtrudeGeometry {
   const geometry = useMemo(() => {
     const extrudeHeight = Math.max(height, 0.2);
@@ -336,8 +366,8 @@ function BuildingPreview({
   modifiers,
 }: BuildingPreviewProps) {
   const groupRef = useRef<THREE.Group>(null);
-  const bodyMaterialRef = useRef<THREE.MeshStandardMaterial>(null);
-  const roofMaterialRef = useRef<THREE.MeshStandardMaterial>(null);
+  const bodyMaterialRef = useRef<THREE.MeshBasicMaterial>(null);
+  const roofMaterialRef = useRef<THREE.MeshBasicMaterial>(null);
 
   const roofThickness =
     modifiers.roofStyle === "slope"
@@ -423,13 +453,11 @@ function BuildingPreview({
   return (
     <group ref={groupRef}>
       <mesh geometry={bodyGeometry} castShadow receiveShadow>
-        <meshStandardMaterial
+        <meshBasicMaterial
           ref={bodyMaterialRef}
           color="#7f97ac"
           transparent
-          opacity={0.82}
-          roughness={0.3}
-          metalness={0.4}
+          opacity={0.88}
         />
       </mesh>
 
@@ -442,13 +470,11 @@ function BuildingPreview({
       </lineSegments>
 
       <mesh position={[0, baseHeight + 0.03, 0]} geometry={roofGeometry} castShadow receiveShadow>
-        <meshStandardMaterial
+        <meshBasicMaterial
           ref={roofMaterialRef}
           color={modifiers.roofStyle === "flat" ? "#1f2329" : "#6f7f8d"}
           transparent
           opacity={0.9}
-          roughness={0.3}
-          metalness={0.4}
         />
       </mesh>
     </group>
@@ -465,9 +491,11 @@ interface SceneFocus {
 function ViewportAutoCenter({
   focus,
   controlsRef,
+  mapZoom,
 }: {
   focus: SceneFocus | null;
   controlsRef: React.RefObject<OrbitControlsImpl | null>;
+  mapZoom?: number;
 }) {
   const { camera } = useThree();
 
@@ -480,7 +508,11 @@ function ViewportAutoCenter({
     const fovRad = perspectiveCamera.fov * DEG_TO_RAD;
     const halfExtent = Math.max(focus.width, focus.depth) / 2;
     const fitDistance = halfExtent / Math.tan(fovRad / 2);
-    const distance = Math.max(fitDistance * 1.7, focus.maxHeight * 1.9, 14);
+    const zoomFactor =
+      typeof mapZoom === "number" && Number.isFinite(mapZoom)
+        ? Math.min(2.2, Math.max(0.85, 1 + (mapZoom - 14) * 0.12))
+        : 1;
+    const distance = Math.max(fitDistance * 1.7, focus.maxHeight * 1.9, 14) / zoomFactor;
 
     const target = {
       x: focus.center.x,
@@ -526,7 +558,7 @@ function ViewportAutoCenter({
         tween.kill();
       }
     };
-  }, [camera, controlsRef, focus]);
+  }, [camera, controlsRef, focus, mapZoom]);
 
   return null;
 }
@@ -634,6 +666,65 @@ function mulberry32(seed: number): () => number {
   };
 }
 
+interface TreeSpec {
+  x: number;
+  z: number;
+  height: number;
+  radius: number;
+  species: "birch" | "oak";
+}
+
+function LowPolyTree({ tree }: { tree: TreeSpec }) {
+  const trunkHeight = tree.height * 0.46;
+  const crownBaseY = trunkHeight + tree.height * 0.18;
+
+  if (tree.species === "birch") {
+    return (
+      <group position={[tree.x, 0, tree.z]}>
+        <mesh position={[0, trunkHeight / 2, 0]} castShadow receiveShadow>
+          <cylinderGeometry args={[tree.radius * 0.16, tree.radius * 0.2, trunkHeight, 6]} />
+          <meshBasicMaterial color="#e8ecef" />
+        </mesh>
+        <mesh position={[0, trunkHeight * 0.48, 0]} castShadow>
+          <cylinderGeometry
+            args={[tree.radius * 0.17, tree.radius * 0.19, trunkHeight * 0.82, 6]}
+          />
+          <meshBasicMaterial color="#1f2937" />
+        </mesh>
+        <mesh position={[0, crownBaseY, 0]} castShadow>
+          <coneGeometry args={[tree.radius * 0.8, tree.height * 0.56, 7]} />
+          <meshBasicMaterial color="#7ea86b" />
+        </mesh>
+        <mesh position={[0, crownBaseY + tree.height * 0.18, 0]} castShadow>
+          <coneGeometry args={[tree.radius * 0.6, tree.height * 0.42, 7]} />
+          <meshBasicMaterial color="#6b9a5b" />
+        </mesh>
+      </group>
+    );
+  }
+
+  return (
+    <group position={[tree.x, 0, tree.z]}>
+      <mesh position={[0, trunkHeight / 2, 0]} castShadow receiveShadow>
+        <cylinderGeometry args={[tree.radius * 0.2, tree.radius * 0.24, trunkHeight, 7]} />
+        <meshBasicMaterial color="#5b4630" />
+      </mesh>
+      <mesh position={[0, crownBaseY, 0]} castShadow>
+        <dodecahedronGeometry args={[tree.radius * 0.76, 0]} />
+        <meshBasicMaterial color="#5b8d4f" />
+      </mesh>
+      <mesh position={[tree.radius * 0.28, crownBaseY + tree.radius * 0.14, -tree.radius * 0.18]} castShadow>
+        <dodecahedronGeometry args={[tree.radius * 0.52, 0]} />
+        <meshBasicMaterial color="#6e9f60" />
+      </mesh>
+      <mesh position={[-tree.radius * 0.24, crownBaseY + tree.radius * 0.12, tree.radius * 0.2]} castShadow>
+        <dodecahedronGeometry args={[tree.radius * 0.48, 0]} />
+        <meshBasicMaterial color="#709f63" />
+      </mesh>
+    </group>
+  );
+}
+
 function ParcelTrees({ shape }: { shape: ParcelShapeData }) {
   const trees = useMemo(() => {
     const loops = shape.boundaries;
@@ -655,13 +746,7 @@ function ParcelTrees({ shape }: { shape: ParcelShapeData }) {
     const targetCount = Math.max(6, Math.min(36, Math.round(areaApprox / 40)));
     const random = mulberry32(createSeed(shape));
 
-    const generated: Array<{
-      x: number;
-      z: number;
-      height: number;
-      radius: number;
-      color: string;
-    }> = [];
+    const generated: TreeSpec[] = [];
 
     let attempts = 0;
     const maxAttempts = targetCount * 40;
@@ -675,13 +760,12 @@ function ParcelTrees({ shape }: { shape: ParcelShapeData }) {
 
       const height = 0.35 + random() * 0.5;
       const radius = height * (0.35 + random() * 0.1);
-      const shade = 90 + Math.round(random() * 40);
       generated.push({
         x,
         z,
         height,
         radius,
-        color: `hsl(120 ${shade}% ${28 + Math.round(random() * 10)}%)`,
+        species: random() > 0.52 ? "oak" : "birch",
       });
     }
 
@@ -691,15 +775,7 @@ function ParcelTrees({ shape }: { shape: ParcelShapeData }) {
   return (
     <group>
       {trees.map((tree, index) => (
-        <mesh
-          key={`tree-${index}`}
-          position={[tree.x, tree.height / 2, tree.z]}
-          castShadow
-          receiveShadow
-        >
-          <coneGeometry args={[tree.radius, tree.height, 8]} />
-          <meshStandardMaterial color={tree.color} roughness={0.85} metalness={0.05} />
-        </mesh>
+        <LowPolyTree key={`tree-${index}`} tree={tree} />
       ))}
     </group>
   );
@@ -710,10 +786,14 @@ function ParcelTrees({ shape }: { shape: ParcelShapeData }) {
 function SceneContent({
   data,
   modifiers,
+  sunTime,
+  mapZoom,
   onCaptureReady,
 }: {
   data: ParcelSceneData | null;
   modifiers: VisualModifiers;
+  sunTime: number;
+  mapZoom?: number;
   onCaptureReady?: (capture: () => string | null) => void;
 }) {
   const controlsRef = useRef<OrbitControlsImpl | null>(null);
@@ -743,6 +823,10 @@ function SceneContent({
   const lightFrustum = focus
     ? Math.max(20, Math.ceil(Math.max(focus.width, focus.depth) * 1.4))
     : 20;
+  const sun = useMemo(
+    () => getSunSettings(sunTime, focus?.center ?? new THREE.Vector3(0, 0, 0)),
+    [sunTime, focus?.center]
+  );
 
   function CaptureBridge({
     onReady,
@@ -770,13 +854,14 @@ function SceneContent({
   return (
     <>
       <CaptureBridge onReady={onCaptureReady} />
-      <ViewportAutoCenter focus={focus} controlsRef={controlsRef} />
+      <ViewportAutoCenter focus={focus} controlsRef={controlsRef} mapZoom={mapZoom} />
       <AutoRotateOnParcelLoad controlsRef={controlsRef} triggerToken={parcelToken} />
 
-      <ambientLight intensity={0.3} />
+      <ambientLight intensity={0.35} />
+      <SoftShadows size={40} samples={32} focus={0.9} />
       <directionalLight
-        position={[8, 12, 6]}
-        intensity={1.2}
+        position={sun.position}
+        intensity={sun.intensity}
         castShadow
         shadow-mapSize={[1024, 1024]}
         shadow-camera-far={70}
@@ -784,17 +869,23 @@ function SceneContent({
         shadow-camera-right={lightFrustum}
         shadow-camera-top={lightFrustum}
         shadow-camera-bottom={-lightFrustum}
-      />
+      >
+        <object3D
+          attach="target"
+          position={[focus?.center.x ?? 0, 0, focus?.center.z ?? 0]}
+        />
+      </directionalLight>
+      <Environment preset="city" blur={0.75} />
 
       {data ? (
         <ContactShadows
           position={[focus?.center.x ?? 0, 0.02, focus?.center.z ?? 0]}
-          opacity={0.55}
+          opacity={sun.shadowOpacity}
           scale={Math.max(focus?.width ?? 20, focus?.depth ?? 20) * 1.8}
-          blur={2.2}
+          blur={1.4}
           far={Math.max(10, data.maxHeight * 1.8)}
-          resolution={1024}
-          color="#0b0b14"
+          resolution={2048}
+          color="#020617"
         />
       ) : null}
 
@@ -848,6 +939,10 @@ interface ParcelSceneProps {
   className?: string;
   promptValue?: string;
   hidePromptInput?: boolean;
+  fillContainer?: boolean;
+  mapZoom?: number;
+   /** Heure solaire (0–24) pilotée par le dashboard. */
+  sunTime?: number;
   onPromptChange?: (prompt: string) => void;
   onCaptureReady?: (capture: () => string | null) => void;
 }
@@ -857,6 +952,9 @@ export function ParcelScene({
   className,
   promptValue,
   hidePromptInput = false,
+  fillContainer = false,
+  mapZoom,
+  sunTime,
   onPromptChange,
   onCaptureReady,
 }: ParcelSceneProps) {
@@ -929,11 +1027,19 @@ export function ParcelScene({
     };
   }, [pluData, resolvedParcelPolygon]);
 
+  const effectiveSunTime = useMemo(() => {
+    if (typeof sunTime === "number" && Number.isFinite(sunTime)) {
+      return Math.min(24, Math.max(0, sunTime));
+    }
+    return 14;
+  }, [sunTime]);
+
   return (
-    <div className="w-full space-y-3">
+    <div className={cn("w-full", fillContainer ? "h-full" : "space-y-3")}>
       <div
         className={cn(
-          "w-full aspect-video rounded-xl border border-border bg-transparent overflow-hidden",
+          "relative w-full rounded-xl border border-border bg-transparent overflow-hidden",
+          fillContainer ? "h-full aspect-auto" : "aspect-video",
           className
         )}
       >
@@ -948,6 +1054,8 @@ export function ParcelScene({
           <SceneContent
             data={sceneData}
             modifiers={modifiers}
+            sunTime={effectiveSunTime}
+            mapZoom={mapZoom}
             onCaptureReady={handleCaptureReady}
           />
         </Canvas>

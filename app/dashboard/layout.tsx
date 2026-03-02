@@ -52,32 +52,26 @@ export default async function DashboardLayout({
 
   return (
     <div className="min-h-screen bg-background-light dark:bg-background-dark text-slate-900 dark:text-slate-100 overflow-hidden">
-      <aside className="hidden md:flex fixed inset-y-0 left-0 w-64 border-r ultra-fine-border glass bg-background-light/80 dark:bg-background-dark/80 shrink-0">
-        <div className="p-6 flex h-full flex-col gap-8">
-          <div className="flex flex-col">
-            <h1 className="text-primary text-lg font-bold tracking-tight">SAS PLU 3D</h1>
-            <p className="text-slate-500 text-xs font-medium uppercase tracking-widest">
-              Premium B2B SaaS
-            </p>
+      <aside className="hidden md:flex fixed inset-y-0 left-0 w-20 glass bg-background-dark/40 dark:bg-background-dark/30 shrink-0">
+        <div className="w-full py-5 px-2 flex h-full flex-col items-center gap-6">
+          <div className="inline-flex h-10 w-10 items-center justify-center rounded-xl bg-primary/15 text-primary shadow-[0_0_20px_rgba(60,60,246,0.35)]">
+            <span className="text-lg font-bold">3D</span>
           </div>
 
-          <SidebarNav />
+          <SidebarNav iconOnly />
 
-          <div className="pt-6 border-t ultra-fine-border">
-            <div className="flex items-center gap-3 px-2">
-              <div className="size-8 rounded-full bg-primary/20 flex items-center justify-center text-primary font-bold text-xs">
-                {initials}
-              </div>
-              <div className="flex flex-col overflow-hidden">
-                <span className="text-sm font-medium truncate">{displayName}</span>
-                <span className="text-[10px] text-slate-500 truncate">{role}</span>
-              </div>
+          <div className="mt-auto relative group">
+            <div className="size-10 rounded-full bg-primary/20 flex items-center justify-center text-primary font-bold text-xs border border-white/10">
+              {initials}
+            </div>
+            <div className="pointer-events-none absolute left-full ml-3 bottom-0 whitespace-nowrap rounded-md border border-white/10 bg-slate-950/95 px-2.5 py-1 text-xs font-medium text-slate-100 opacity-0 shadow-lg transition-opacity group-hover:opacity-100">
+              {displayName} · {role}
             </div>
           </div>
         </div>
       </aside>
 
-      <div className="md:ml-64 min-h-screen flex flex-col">
+      <div className="md:ml-20 min-h-screen flex flex-col">
         <MobileSidebar displayName={displayName} initials={initials} role={role} />
         <main className="flex-1 overflow-y-auto">
           <div className="min-h-full p-4 md:p-8">{children}</div>

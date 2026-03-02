@@ -132,6 +132,10 @@
 }
 
 @layer utilities {
+  .premium-glass {
+    @apply bg-white/[0.02] backdrop-blur-[20px] border-[0.5px] border-white/[0.08] shadow-[0_20px_50px_rgba(0,0,0,0.5)];
+  }
+
   .glass {
     @apply backdrop-blur-md;
     -webkit-backdrop-filter: blur(12px);
@@ -140,6 +144,14 @@
 
   .glass-panel {
     @apply bg-white/[0.03] backdrop-blur-xl border border-white/[0.08] shadow-2xl;
+  }
+
+  .glass-card {
+    @apply bg-white/[0.01] backdrop-blur-2xl border border-white/[0.05] rounded-3xl shadow-[0_8px_32px_0_rgba(0,0,0,0.37)];
+  }
+
+  .text-gradient {
+    @apply bg-clip-text text-transparent bg-gradient-to-br from-white to-white/50;
   }
 
   .ultra-fine-border {
@@ -151,5 +163,13 @@
       linear-gradient(var(--background), var(--background)) padding-box,
       linear-gradient(to bottom right, rgba(60, 60, 246, 0.5), transparent) border-box;
     border: 1px solid transparent;
+  }
+
+  .data-gradient {
+    @apply bg-gradient-to-br from-primary via-indigo-500 to-purple-600;
+  }
+  .subtle-grid {
+    background-image: radial-gradient(rgba(255,255,255,0.05) 1px, transparent 0);
+    background-size: 40px 40px;
   }
 }
