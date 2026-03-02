@@ -1,5 +1,6 @@
 import { jsPDF } from "jspdf";
 import { NextRequest, NextResponse } from "next/server";
+import { getDvfSummaryNearby } from "@/src/lib/plu-engine";
 
 export const runtime = "nodejs";
 
@@ -22,6 +23,12 @@ interface ExportPayload {
     } | null;
   };
   analysisPrompt?: string;
+  dvf?: {
+    medianValueEur?: number | null;
+    mutationCount?: number | null;
+    source?: string | null;
+  } | null;
+  sceneImageUrl?: string | null;
   sceneImageDataUrl?: string | null;
 }
 
@@ -34,6 +41,30 @@ function formatDate(date: Date): string {
 
 function safeFilename(value: string): string {
   return value.replace(/[^a-zA-Z0-9-_]/g, "-").slice(0, 60);
+}
+
+function formatCurrencyEur(value: number | null | undefined): string {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    return "Non disponible";
+  }
+  return new Intl.NumberFormat("fr-FR", {
+    style: "currency",
+    currency: "EUR",
+    maximumFractionDigits: 0,
+  }).format(value);
+}
+
+async function fetchImageAsDataUrl(url: string): Promise<string | null> {
+  if (!/^https?:\/\//.test(url)) return null;
+
+  const response = await fetch(url, { cache: "no-store" });
+  if (!response.ok) return null;
+
+  const contentType = response.headers.get("content-type") ?? "image/png";
+  if (!contentType.startsWith("image/")) return null;
+
+  const buffer = Buffer.from(await response.arrayBuffer());
+  return `data:${contentType};base64,${buffer.toString("base64")}`;
 }
 
 function drawTableRow(
@@ -100,6 +131,29 @@ export async function POST(request: NextRequest) {
     );
   }
 
+  let dvfMedianValueEur: number | null = null;
+  let dvfMutationCount: number | null = null;
+  let dvfSource = payload.dvf?.source ?? "DVF Etalab";
+
+  if (
+    typeof payload.dvf?.medianValueEur === "number" ||
+    typeof payload.dvf?.mutationCount === "number"
+  ) {
+    dvfMedianValueEur =
+      typeof payload.dvf?.medianValueEur === "number" ? payload.dvf.medianValueEur : null;
+    dvfMutationCount =
+      typeof payload.dvf?.mutationCount === "number" ? payload.dvf.mutationCount : null;
+  } else if (typeof payload.address.lon === "number" && typeof payload.address.lat === "number") {
+    try {
+      const dvfSummary = await getDvfSummaryNearby(payload.address.lon, payload.address.lat);
+      dvfMedianValueEur = dvfSummary?.medianValueEur ?? null;
+      dvfMutationCount = dvfSummary?.mutationCount ?? null;
+      dvfSource = dvfSummary?.source ?? dvfSource;
+    } catch (error) {
+      console.warn("[export.pdf][dvf] fallback unavailable", error);
+    }
+  }
+
   const doc = new jsPDF({ format: "a4", unit: "mm", orientation: "portrait" });
 
   // Header (palette Slate/Zinc)
@@ -136,6 +190,14 @@ export async function POST(request: NextRequest) {
     ? `${footprint.width} m x ${footprint.depth} m (${(footprint.width * footprint.depth).toFixed(0)} m²)`
     : "Non renseignée";
   y = drawTableRow(doc, y, "Emprise au sol", footprintValue);
+  y = drawTableRow(doc, y, "Prix median (DVF)", formatCurrencyEur(dvfMedianValueEur));
+  y = drawTableRow(
+    doc,
+    y,
+    "Nombre de ventes",
+    typeof dvfMutationCount === "number" ? `${dvfMutationCount}` : "Non disponible"
+  );
+  y = drawTableRow(doc, y, "Source marche", dvfSource);
 
   y += 10;
 
@@ -159,10 +221,16 @@ export async function POST(request: NextRequest) {
   doc.text(promptLines, 18, y + 7);
   y += promptBoxHeight + 10;
 
-  if (
-    payload.sceneImageDataUrl &&
-    payload.sceneImageDataUrl.startsWith("data:image/")
-  ) {
+  let sceneImageDataUrl = payload.sceneImageDataUrl ?? null;
+  if (!sceneImageDataUrl && payload.sceneImageUrl) {
+    try {
+      sceneImageDataUrl = await fetchImageAsDataUrl(payload.sceneImageUrl);
+    } catch (error) {
+      console.error("[export.pdf][sceneImageUrl]", error);
+    }
+  }
+
+  if (sceneImageDataUrl && sceneImageDataUrl.startsWith("data:image/")) {
     doc.setTextColor(24, 24, 27);
     doc.setFont("helvetica", "bold");
     doc.setFontSize(12);
@@ -172,7 +240,7 @@ export async function POST(request: NextRequest) {
     try {
       const maxWidth = 182;
       const maxHeight = 297 - y - 16;
-      const imageProps = doc.getImageProperties(payload.sceneImageDataUrl);
+      const imageProps = doc.getImageProperties(sceneImageDataUrl);
       const ratio = imageProps.width / imageProps.height;
 
       let renderWidth = maxWidth;
@@ -186,7 +254,7 @@ export async function POST(request: NextRequest) {
       const imageY = y + 4;
       doc.setDrawColor(161, 161, 170); // zinc-400
       doc.roundedRect(imageX - 1.5, imageY - 1.5, renderWidth + 3, renderHeight + 3, 2, 2);
-      doc.addImage(payload.sceneImageDataUrl, "PNG", imageX, imageY, renderWidth, renderHeight);
+      doc.addImage(sceneImageDataUrl, "PNG", imageX, imageY, renderWidth, renderHeight);
     } catch {
       doc.setFont("helvetica", "normal");
       doc.setFontSize(10);

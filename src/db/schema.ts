@@ -6,6 +6,7 @@ import {
   jsonb,
   boolean,
   timestamp,
+  integer,
   index,
 } from "drizzle-orm/pg-core";
 
@@ -16,6 +17,8 @@ export const user = pgTable("user", {
   email: text("email").notNull().unique(),
   emailVerified: boolean("email_verified").default(false).notNull(),
   image: text("image"),
+  role: text("role").default("FREE").notNull(),
+  stripeCustomerId: text("stripe_customer_id"),
   createdAt: timestamp("created_at").defaultNow().notNull(),
   updatedAt: timestamp("updated_at")
     .defaultNow()
@@ -88,14 +91,54 @@ export const projects = pgTable("projects", {
   userId: text("user_id")
     .notNull()
     .references(() => user.id, { onDelete: "cascade" }),
+  isPriority: boolean("is_priority").default(false).notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at")
+    .defaultNow()
+    .$onUpdate(() => new Date())
+    .notNull(),
   metadata: jsonb("metadata").$type<Record<string, unknown>>(),
 });
+
+export const subscription = pgTable(
+  "subscription",
+  {
+    id: text("id").primaryKey(),
+    plan: text("plan").notNull(),
+    referenceId: text("reference_id").notNull(),
+    stripeCustomerId: text("stripe_customer_id"),
+    stripeSubscriptionId: text("stripe_subscription_id"),
+    status: text("status").default("incomplete").notNull(),
+    periodStart: timestamp("period_start"),
+    periodEnd: timestamp("period_end"),
+    trialStart: timestamp("trial_start"),
+    trialEnd: timestamp("trial_end"),
+    cancelAtPeriodEnd: boolean("cancel_at_period_end").default(false).notNull(),
+    cancelAt: timestamp("cancel_at"),
+    canceledAt: timestamp("canceled_at"),
+    endedAt: timestamp("ended_at"),
+    seats: integer("seats"),
+    billingInterval: text("billing_interval"),
+    stripeScheduleId: text("stripe_schedule_id"),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+    updatedAt: timestamp("updated_at")
+      .defaultNow()
+      .$onUpdate(() => new Date())
+      .notNull(),
+  },
+  (table) => [
+    index("subscription_reference_id_idx").on(table.referenceId),
+    index("subscription_stripe_customer_id_idx").on(table.stripeCustomerId),
+    index("subscription_stripe_subscription_id_idx").on(table.stripeSubscriptionId),
+  ],
+);
 
 // Relations
 export const userRelations = relations(user, ({ many }) => ({
   sessions: many(session),
   accounts: many(account),
   projects: many(projects),
+  subscriptions: many(subscription),
 }));
 
 export const sessionRelations = relations(session, ({ one }) => ({
@@ -119,6 +162,13 @@ export const projectsRelations = relations(projects, ({ one }) => ({
   }),
 }));
 
+export const subscriptionRelations = relations(subscription, ({ one }) => ({
+  user: one(user, {
+    fields: [subscription.referenceId],
+    references: [user.id],
+  }),
+}));
+
 // Objet schema global (tables + relations)
 export const schema = {
   user,
@@ -126,8 +176,10 @@ export const schema = {
   account,
   verification,
   projects,
+  subscription,
   userRelations,
   sessionRelations,
   accountRelations,
   projectsRelations,
+  subscriptionRelations,
 };
