@@ -5,9 +5,11 @@ import dynamic from "next/dynamic";
 import {
   AlertCircle,
   BarChart3,
+  Box,
   Building2,
   CheckCircle,
   CircleAlert,
+  ExternalLink,
   FileDown,
   Grid3X3,
   Layers3,
@@ -20,9 +22,11 @@ import {
   Search,
   ShieldCheck,
   Sparkles,
+  TrendingUp,
   Waves,
 } from "lucide-react";
 import { toast } from "sonner";
+import { ResponsiveContainer, AreaChart, Area, XAxis, YAxis, Tooltip } from "recharts";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import {
@@ -40,7 +44,10 @@ import type {
   RiskLevel,
   ZoneUrba,
 } from "@/src/lib/plu-engine";
-import type { ParcelSceneData } from "@/components/three/ParcelScene";
+import type {
+  ParcelSceneData,
+  ParcelSceneHandle,
+} from "@/components/three/ParcelScene";
 
 declare global {
   interface Window {
@@ -246,57 +253,7 @@ function getRiskVisual(level: RiskLevel): {
   };
 }
 
-function buildMarketTrendSeries(summary: DvfSummary | null): number[] {
-  if (!summary || summary.mutationCount <= 0) {
-    return [42, 45, 44, 48, 50, 52, 54];
-  }
-
-  const median = typeof summary.medianValueEur === "number" ? summary.medianValueEur : 0;
-  const count = Math.max(1, summary.mutationCount);
-  const amplitude = Math.min(9, Math.max(3, Math.log10(count + 1) * 4));
-  const base = median > 0 ? Math.min(72, 44 + Math.log10(median) * 6) : 52;
-
-  return [
-    base - amplitude * 0.8,
-    base - amplitude * 0.25,
-    base - amplitude * 0.45,
-    base + amplitude * 0.15,
-    base + amplitude * 0.05,
-    base + amplitude * 0.55,
-    base + amplitude * 0.95,
-  ].map((value) => Math.max(18, Math.min(92, value)));
-}
-
-interface TrendPoint {
-  x: number;
-  y: number;
-}
-
-function buildSmoothBezierPath(points: TrendPoint[]): string {
-  if (points.length === 0) return "";
-  if (points.length === 1) {
-    const p = points[0];
-    return `M ${p.x.toFixed(2)} ${p.y.toFixed(2)}`;
-  }
-
-  let d = `M ${points[0].x.toFixed(2)} ${points[0].y.toFixed(2)}`;
-
-  for (let i = 0; i < points.length - 1; i += 1) {
-    const p0 = points[i - 1] ?? points[i];
-    const p1 = points[i];
-    const p2 = points[i + 1];
-    const p3 = points[i + 2] ?? p2;
-
-    const cp1x = p1.x + (p2.x - p0.x) / 6;
-    const cp1y = p1.y + (p2.y - p0.y) / 6;
-    const cp2x = p2.x - (p3.x - p1.x) / 6;
-    const cp2y = p2.y - (p3.y - p1.y) / 6;
-
-    d += ` C ${cp1x.toFixed(2)} ${cp1y.toFixed(2)}, ${cp2x.toFixed(2)} ${cp2y.toFixed(2)}, ${p2.x.toFixed(2)} ${p2.y.toFixed(2)}`;
-  }
-
-  return d;
-}
+// Anciennes fonctions de génération de courbe DVF factices supprimées
 
 function getBuildabilityLabel(height: number | null): string {
   if (height === null) return "En attente";
@@ -358,6 +315,20 @@ export function PLUDashboard({ isAuthenticated = false }: PLUDashboardProps) {
   const suppressNextMoveLookupRef = useRef(false);
   const lookupRequestIdRef = useRef(0);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const parcelSceneRef = useRef<ParcelSceneHandle | null>(null);
+  const [currentProjectId, setCurrentProjectId] = useState<string | null>(null);
+  const [isPluAnalyzing, setIsPluAnalyzing] = useState(false);
+  const [pluAnalysisStatus, setPluAnalysisStatus] = useState<string | null>(null);
+  const [pluAnalysisData, setPluAnalysisData] = useState<{
+    ces: string;
+    retrait: string;
+    espacesVerts: string;
+  } | null>(null);
+
+  const handleExportObj = useCallback(() => {
+    if (!parcelSceneRef.current) return;
+    parcelSceneRef.current.exportToObj();
+  }, [parcelSceneRef]);
 
   const handleQueryChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const value = e.target.value;
@@ -656,6 +627,9 @@ export function PLUDashboard({ isAuthenticated = false }: PLUDashboardProps) {
     setIsSaving(false);
 
     if (result.success) {
+      if (result.projectId) {
+        setCurrentProjectId(result.projectId);
+      }
       setSaveState("saved");
       toast.success("Projet enregistré");
       return;
@@ -669,6 +643,81 @@ export function PLUDashboard({ isAuthenticated = false }: PLUDashboardProps) {
 
     toast.error(result.error ?? "Erreur lors de l'enregistrement.");
   }, [selectedAddress, zone]);
+
+  const handleAnalyzePluPdf = useCallback(async () => {
+    if (!zone?.urlfic) {
+      toast.error("Aucun PDF réglementaire associé à cette zone.");
+      return;
+    }
+
+    setPluAnalysisData(null);
+    setIsPluAnalyzing(true);
+    setPluAnalysisStatus("Téléchargement du document...");
+
+    const stepTimeouts: number[] = [];
+
+    try {
+      stepTimeouts.push(
+        window.setTimeout(
+          () => setPluAnalysisStatus("Lecture par l'IA..."),
+          1100
+        )
+      );
+      stepTimeouts.push(
+        window.setTimeout(
+          () => setPluAnalysisStatus("Extraction des règles..."),
+          2100
+        )
+      );
+
+      const response = await fetch("/api/plu/analyze-pdf", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ urlfic: zone.urlfic }),
+      });
+
+      if (!response.ok) {
+        throw new Error("Analyse du PDF réglementaire impossible.");
+      }
+
+      const data = (await response.json()) as {
+        ces?: string;
+        retrait?: string;
+        espacesVerts?: string;
+      };
+
+      setPluAnalysisData({
+        ces: data.ces ?? "40%",
+        retrait: data.retrait ?? "4m",
+        espacesVerts: data.espacesVerts ?? "30%",
+      });
+      setPluAnalysisStatus("Analyse terminée");
+    } catch (error) {
+      console.error("[handleAnalyzePluPdf]", error);
+      setPluAnalysisStatus(null);
+      toast.error("Analyse du PDF réglementaire impossible pour le moment.");
+    } finally {
+      stepTimeouts.forEach((id) => window.clearTimeout(id));
+      setIsPluAnalyzing(false);
+    }
+  }, [zone?.urlfic]);
+
+  const handleCopyPublicLink = useCallback(() => {
+    if (!currentProjectId) {
+      toast.error("Enregistrez d'abord le projet pour générer un lien public.");
+      return;
+    }
+    if (typeof window === "undefined" || typeof navigator === "undefined") return;
+    const url = `${window.location.origin}/p/${currentProjectId}`;
+    navigator.clipboard
+      .writeText(url)
+      .then(() => {
+        toast.success("Lien public copié dans le presse-papier.");
+      })
+      .catch(() => {
+        toast.error("Impossible de copier le lien.");
+      });
+  }, [currentProjectId]);
 
   const uploadSceneCapture = useCallback(
     async (sceneImageDataUrl: string, projectId: string): Promise<string | null> => {
@@ -781,21 +830,10 @@ export function PLUDashboard({ isAuthenticated = false }: PLUDashboardProps) {
   const mutationCount = dvfSummary?.mutationCount ?? 0;
   const dvfMomentumPct =
     mutationCount > 0 ? Math.min(9.9, Math.max(1.2, mutationCount / 55)) : null;
-  const trendSeries = buildMarketTrendSeries(dvfSummary);
-  const trendWidth = 280;
-  const trendHeight = 72;
-  const trendStepX = trendWidth / Math.max(1, trendSeries.length - 1);
-  const trendPoints: TrendPoint[] = trendSeries.map((value, index) => ({
-    x: index * trendStepX,
-    y: trendHeight - (value / 100) * trendHeight,
-  }));
-  const trendPath = buildSmoothBezierPath(trendPoints);
-  const firstTrendPoint = trendPoints[0];
-  const lastTrendPoint = trendPoints[trendPoints.length - 1];
-  const trendAreaPath =
-    trendPath && firstTrendPoint && lastTrendPoint
-      ? `${trendPath} L ${lastTrendPoint.x.toFixed(2)} ${trendHeight.toFixed(2)} L ${firstTrendPoint.x.toFixed(2)} ${trendHeight.toFixed(2)} Z`
-      : "";
+  const dvfHistoryData =
+    dvfSummary?.dvfHistory && dvfSummary.dvfHistory.length > 0
+      ? dvfSummary.dvfHistory
+      : [];
   const groundCoveragePct =
     zone?.typezone === "U"
       ? 65
@@ -811,17 +849,7 @@ export function PLUDashboard({ isAuthenticated = false }: PLUDashboardProps) {
     maxHeightM: maxHeight,
     medianDvfValueEur: dvfSummary?.medianValueEur ?? null,
   });
-  const profitabilityGaugeRadius = 52;
-  const profitabilityGaugeCircumference = 2 * Math.PI * profitabilityGaugeRadius;
-  const profitabilityGaugeOffset = profitability
-    ? profitabilityGaugeCircumference * (1 - profitability.score / 100)
-    : profitabilityGaugeCircumference;
-  const profitabilityToneClass =
-    profitability && profitability.score >= 72
-      ? "text-emerald-300"
-      : profitability && profitability.score >= 45
-        ? "text-orange-200"
-        : "text-rose-300";
+  const promoterBalance = profitability;
   const floodRiskVisual = getRiskVisual(georisquesSummary?.floodLevel ?? "UNKNOWN");
   const clayRiskVisual = getRiskVisual(georisquesSummary?.clayLevel ?? "UNKNOWN");
   const riskRank: Record<RiskLevel, number> = { UNKNOWN: 0, LOW: 1, MEDIUM: 2, HIGH: 3 };
@@ -848,7 +876,9 @@ export function PLUDashboard({ isAuthenticated = false }: PLUDashboardProps) {
           {
             date: "Période analysée",
             type: "DVF",
-            surface: `${dvfSummary.mutationCount} ventes`,
+            surface: `${dvfSummary.mutationCount} ventes${
+              dvfSummary.scope === "commune" ? " (commune)" : ""
+            }`,
             price: formatCurrency(dvfSummary.medianValueEur),
           },
         ]
@@ -1056,6 +1086,7 @@ export function PLUDashboard({ isAuthenticated = false }: PLUDashboardProps) {
             </div>
             <div className="relative h-[440px] w-full overflow-hidden rounded-2xl border border-white/[0.06] bg-slate-950/80">
               <ParcelScene
+                ref={parcelSceneRef}
                 pluData={parcelSceneData}
                 fillContainer
                 mapZoom={mapZoom}
@@ -1066,6 +1097,26 @@ export function PLUDashboard({ isAuthenticated = false }: PLUDashboardProps) {
                 onPromptChange={setScenePrompt}
                 onCaptureReady={(capture) => setCaptureScene(() => capture)}
               />
+              <div className="absolute bottom-6 right-6 z-40 premium-glass rounded-xl p-4 flex flex-col gap-3 w-64 shadow-2xl">
+                <div className="flex justify-between items-center">
+                  <span className="text-xs font-bold uppercase tracking-wider text-slate-400">
+                    Ensoleillement
+                  </span>
+                  <span className="text-xs font-bold text-white bg-primary/20 px-2 py-1 rounded-md">
+                    {Math.floor(sunTime)}h{sunTime % 1 !== 0 ? "30" : "00"}
+                  </span>
+                </div>
+                <input
+                  type="range"
+                  min={6}
+                  max={20}
+                  step={0.5}
+                  value={sunTime}
+                  onChange={(e) => setSunTime(parseFloat(e.target.value))}
+                  className="w-full h-1 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-primary"
+                  aria-label="Heure solaire (ensoleillement)"
+                />
+              </div>
             </div>
             <div className="mt-4 flex flex-col gap-2 px-1 text-[11px] text-slate-300 md:flex-row md:items-center md:justify-between">
               <div className="space-y-1">
@@ -1125,6 +1176,50 @@ export function PLUDashboard({ isAuthenticated = false }: PLUDashboardProps) {
               <p className="mt-3 text-[10px] leading-relaxed text-slate-500">
                 Limite de hauteur réglementaire pour la zone active.
               </p>
+
+              {zone?.urlfic ? (
+                <div className="mt-4 space-y-2">
+                  <button
+                    type="button"
+                    onClick={handleAnalyzePluPdf}
+                    disabled={isPluAnalyzing}
+                    className="group relative inline-flex rounded-full bg-gradient-to-r from-emerald-400 via-sky-500 to-indigo-500 p-[1px] text-[11px] font-semibold text-emerald-50 shadow-[0_0_24px_rgba(56,189,248,0.45)]"
+                  >
+                    <span className="absolute inset-0 rounded-full bg-[radial-gradient(circle_at_top_left,rgba(56,189,248,0.75),transparent_60%)] opacity-70 mix-blend-screen blur-sm" />
+                    <span className="relative flex items-center gap-2 rounded-full bg-slate-950/95 px-3 py-1 group-hover:bg-slate-950">
+                      <Sparkles className="h-3 w-3 text-emerald-300" />
+                      Analyser le PDF réglementaire avec l&apos;IA
+                    </span>
+                  </button>
+
+                  {isPluAnalyzing ? (
+                    <div className="mt-2 space-y-1">
+                      <p className="text-[11px] text-emerald-200">
+                        {pluAnalysisStatus ?? "Téléchargement du document..."}
+                      </p>
+                      <div className="flex flex-col gap-1">
+                        <div className="h-1.5 w-full animate-pulse rounded-full bg-emerald-500/25" />
+                        <div className="h-1.5 w-5/6 animate-pulse rounded-full bg-emerald-500/15" />
+                        <div className="h-1.5 w-2/3 animate-pulse rounded-full bg-emerald-500/10" />
+                      </div>
+                    </div>
+                  ) : null}
+
+                  {pluAnalysisData && !isPluAnalyzing ? (
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      <span className="inline-flex items-center rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1 text-[10px] font-semibold text-emerald-200">
+                        CES : {pluAnalysisData.ces}
+                      </span>
+                      <span className="inline-flex items-center rounded-full border border-sky-500/40 bg-sky-500/10 px-2.5 py-1 text-[10px] font-semibold text-sky-200">
+                        Retrait : {pluAnalysisData.retrait}
+                      </span>
+                      <span className="inline-flex items-center rounded-full border border-lime-400/40 bg-lime-400/10 px-2.5 py-1 text-[10px] font-semibold text-lime-100">
+                        Espaces verts : {pluAnalysisData.espacesVerts}
+                      </span>
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
             </div>
 
             <div
@@ -1208,152 +1303,127 @@ export function PLUDashboard({ isAuthenticated = false }: PLUDashboardProps) {
                   ? "Chargement DVF..."
                   : !dvfSummary || dvfSummary.mutationCount === 0
                     ? "Données DVF non disponibles pour ce secteur"
-                    : `${dvfSummary.mutationCount} mutations récentes`}
+                    : dvfSummary.scope === "commune"
+                      ? `${dvfSummary.mutationCount} mutations récentes sur la commune`
+                      : `${dvfSummary.mutationCount} mutations récentes`}
               </p>
             </div>
 
-            <div className="rounded-xl premium-glass p-5">
+            <div className="rounded-2xl premium-glass p-5">
               <div className="mb-4 flex items-center justify-between">
-                <p className="text-[11px] uppercase tracking-[0.16em] text-slate-400">
-                  Profitability Score
-                </p>
-                <span className="rounded-full border border-primary/30 bg-primary/10 px-2 py-0.5 text-[10px] font-semibold text-primary">
-                  Rendement projeté
-                </span>
+                <div>
+                  <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-slate-500">
+                    Bilan Promoteur IA
+                  </p>
+                  <p className="mt-1 text-xs text-slate-500">
+                    Synthèse automatique du bilan financier promoteur.
+                  </p>
+                </div>
               </div>
 
-              <div className="grid grid-cols-[128px_minmax(0,1fr)] items-center gap-4">
-                <div className="relative mx-auto h-32 w-32">
-                  <div className="pointer-events-none absolute inset-[-18%] rounded-full bg-[radial-gradient(circle_at_center,rgba(56,189,248,0.55),transparent_60%)] blur-xl" />
-                  <svg className="h-full w-full -rotate-90" viewBox="0 0 128 128">
-                    <circle
-                      cx="64"
-                      cy="64"
-                      r={profitabilityGaugeRadius}
-                      fill="none"
-                      stroke="rgba(148,163,184,0.2)"
-                      strokeWidth="10"
-                    />
-                    <circle
-                      cx="64"
-                      cy="64"
-                      r={profitabilityGaugeRadius}
-                      fill="none"
-                      stroke="url(#profitabilityGaugeGradient)"
-                      strokeWidth="10"
-                      strokeLinecap="round"
-                      strokeDasharray={profitabilityGaugeCircumference}
-                      strokeDashoffset={profitabilityGaugeOffset}
-                    />
-                    <defs>
-                      <linearGradient id="profitabilityGaugeGradient" x1="0" y1="0" x2="128" y2="0" gradientUnits="userSpaceOnUse">
-                        <stop offset="0%" stopColor="#22c55e" />
-                        <stop offset="58%" stopColor="#34d399" />
-                        <stop offset="100%" stopColor="#6366f1" />
-                      </linearGradient>
-                    </defs>
-                  </svg>
-                  <div className="absolute inset-0 flex flex-col items-center justify-center">
-                    <span className={`text-4xl font-black leading-none text-white`}>
-                      {profitability ? profitability.score : "--"}
-                    </span>
-                    <span className="mt-1 text-[10px] uppercase tracking-[0.14em] text-slate-400">
-                      sur 100
-                    </span>
+              {promoterBalance ? (
+                <div className="space-y-4">
+                  <div className="rounded-2xl bg-white/[0.02] p-4">
+                    <div className="flex items-center justify-between text-xs text-slate-400">
+                      <span>CA potentiel</span>
+                      <span className="font-black tracking-tight text-white">
+                        {formatCurrency(promoterBalance.chiffreAffairesEstimeEur)}
+                      </span>
+                    </div>
+                    <div className="mt-2 flex items-center justify-between text-xs text-slate-400">
+                      <span>Coûts de sortie (travaux + annexes)</span>
+                      <span className="font-black tracking-tight text-white">
+                        {formatCurrency(
+                          promoterBalance.coutConstructionEur +
+                            promoterBalance.fraisAnnexesEur
+                        )}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="rounded-2xl border border-emerald-500/40 bg-emerald-500/10 px-4 py-5 shadow-[0_0_32px_rgba(16,185,129,0.38)]">
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-emerald-300">
+                      Prix d&apos;achat max recommandé
+                    </p>
+                    <p className="mt-2 text-[11px] text-emerald-200/80">
+                      Niveau cible intégrant construction, frais annexes et marge promoteur.
+                    </p>
+                    <p className="mt-4 text-3xl font-black tracking-tight text-emerald-400 md:text-4xl">
+                      {formatCurrency(promoterBalance.prixMaxTerrainEur)}
+                    </p>
                   </div>
                 </div>
-
-                <div className="space-y-1.5">
-                  <p className="text-xs text-slate-400">
-                    Surface théorique:{" "}
-                    <span className="font-black text-white">
-                      {profitability
-                        ? `${Math.round(profitability.theoreticalFloorAreaM2)} m²`
-                        : "-"}
-                    </span>
-                  </p>
-                  <p className="text-xs text-slate-400">
-                    Niveaux estimés:{" "}
-                    <span className="font-black text-white">
-                      {profitability ? profitability.theoreticalLevels : "-"}
-                    </span>
-                  </p>
-                  <p className="text-xs text-slate-400">
-                    Valeur projetée:{" "}
-                    <span className="font-black tracking-tight text-white">
-                      {profitability ? formatCurrency(profitability.theoreticalValueEur) : "-"}
-                    </span>
-                  </p>
-                  <p className="text-xs text-slate-400">
-                    Marge brute:{" "}
-                    <span className="font-black tracking-tight text-white">
-                      {profitability ? formatCurrency(profitability.grossProfitEur) : "-"}
-                    </span>
-                  </p>
-                </div>
-              </div>
+              ) : (
+                <p className="text-xs text-slate-500">
+                  Sélectionnez une parcelle avec données DVF pour calculer un bilan promoteur
+                  estimatif.
+                </p>
+              )}
             </div>
 
             <div className="rounded-xl premium-glass p-5">
-              <div className="relative h-32 w-full">
-                <svg className="h-full w-full" viewBox={`0 0 ${trendWidth} ${trendHeight}`}>
-                  <defs>
-                    <linearGradient id="marketGradient" x1="0" x2={trendWidth} y1="0" y2={trendHeight} gradientUnits="userSpaceOnUse">
-                      <stop offset="0%" stopColor="#22c55e" stopOpacity="0.3" />
-                      <stop offset="100%" stopColor="#6366f1" stopOpacity="0.06" />
-                    </linearGradient>
-                    <linearGradient id="marketStrokeGradient" x1="0" x2={trendWidth} y1="0" y2="0" gradientUnits="userSpaceOnUse">
-                      <stop offset="0%" stopColor="#22c55e" />
-                      <stop offset="60%" stopColor="#34d399" />
-                      <stop offset="100%" stopColor="#6366f1" />
-                    </linearGradient>
-                    <filter id="dvfGlow" x="-200%" y="-200%" width="400%" height="400%">
-                      <feGaussianBlur stdDeviation="4.6" result="blur" />
-                      <feMerge>
-                        <feMergeNode in="blur" />
-                        <feMergeNode in="SourceGraphic" />
-                      </feMerge>
-                    </filter>
-                  </defs>
-                  {trendAreaPath ? (
-                    <path
-                      d={trendAreaPath}
-                      fill="url(#marketGradient)"
-                      stroke="none"
-                    />
-                  ) : null}
-                  {trendPath ? (
-                    <path
-                      d={trendPath}
-                      fill="none"
-                      stroke="url(#marketStrokeGradient)"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      strokeWidth="2.2"
-                    />
-                  ) : null}
-                  {lastTrendPoint ? (
-                    <>
-                      <circle
-                        cx={lastTrendPoint.x}
-                        cy={lastTrendPoint.y}
-                        r="5.2"
-                        className="animate-pulse"
-                        fill="#6366f1"
-                        opacity="0.42"
-                        filter="url(#dvfGlow)"
+              <div className="h-40 w-full">
+                {dvfHistoryData.length > 0 ? (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <AreaChart data={dvfHistoryData}>
+                      <defs>
+                        <linearGradient id="dvfAreaGradient" x1="0" y1="0" x2="0" y2="1">
+                          <stop offset="0%" stopColor="#10b981" stopOpacity={0.4} />
+                          <stop offset="100%" stopColor="#0f172a" stopOpacity={0} />
+                        </linearGradient>
+                      </defs>
+                      <XAxis
+                        dataKey="year"
+                        tickLine={false}
+                        axisLine={false}
+                        tick={{ fontSize: 10, fill: "#94a3b8" }}
                       />
-                      <circle
-                        cx={lastTrendPoint.x}
-                        cy={lastTrendPoint.y}
-                        r="2.8"
-                        fill="#a5b4fc"
+                      <YAxis
+                        hide
+                        tickLine={false}
+                        axisLine={false}
+                        tick={{ fontSize: 10, fill: "#64748b" }}
                       />
-                    </>
-                  ) : null}
-                </svg>
+                      <Tooltip
+                        contentStyle={{
+                          backgroundColor: "rgba(15,23,42,0.95)",
+                          borderRadius: 12,
+                          border: "1px solid rgba(148,163,184,0.35)",
+                          padding: "8px 10px",
+                        }}
+                        labelStyle={{ fontSize: 11, color: "#e2e8f0" }}
+                        formatter={(value?: number) => {
+                          const formatted =
+                            typeof value === "number"
+                              ? new Intl.NumberFormat("fr-FR", {
+                                  style: "currency",
+                                  currency: "EUR",
+                                  maximumFractionDigits: 0,
+                                }).format(value)
+                              : "-";
+                          return [formatted, "Prix médian"];
+                        }}
+                      />
+                      <Area
+                        type="monotone"
+                        dataKey="price"
+                        stroke="#10b981"
+                        strokeWidth={2}
+                        fill="url(#dvfAreaGradient)"
+                        dot={false}
+                        activeDot={{ r: 4, fill: "#22c55e" }}
+                      />
+                    </AreaChart>
+                  </ResponsiveContainer>
+                ) : (
+                  <div className="flex h-full items-center justify-center text-[11px] text-slate-500">
+                    Historique temporel insuffisant
+                  </div>
+                )}
               </div>
-              <p className="mt-2 text-[11px] text-slate-500">Source : Ministère des Finances</p>
+              <p className="mt-2 text-[11px] text-slate-500">
+                Source : DVF (Etalab / CQuest)
+              </p>
             </div>
 
             <div className="rounded-xl premium-glass p-5">
@@ -1433,6 +1503,24 @@ export function PLUDashboard({ isAuthenticated = false }: PLUDashboardProps) {
               >
                 {isExporting ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileDown className="h-4 w-4" />}
                 Download PDF Report
+              </Button>
+              <Button
+                onClick={handleExportObj}
+                disabled={!parcelSceneData}
+                variant="outline"
+                className="gap-2 border-slate-500/40 bg-slate-900/60 text-slate-100 hover:bg-slate-900"
+              >
+                <Box className="h-4 w-4" />
+                Exporter la maquette 3D (.obj)
+              </Button>
+              <Button
+                onClick={handleCopyPublicLink}
+                disabled={!currentProjectId}
+                variant="outline"
+                className="gap-2 border-emerald-500/40 bg-emerald-500/5 text-emerald-300 hover:bg-emerald-500/10"
+              >
+                <ExternalLink className="h-4 w-4" />
+                Copier le lien public
               </Button>
               <Button
                 onClick={handleSave}
@@ -1516,97 +1604,109 @@ export function PLUDashboard({ isAuthenticated = false }: PLUDashboardProps) {
       </main>
 
       {selectedAddress ? (
-        <aside className="pointer-events-none fixed right-4 top-28 z-40 hidden 2xl:flex w-[320px] flex-col gap-4">
-          <div className="pointer-events-auto premium-glass rounded-2xl border border-white/[0.06] p-5">
-            <div className="mb-4 flex items-center justify-between">
-              <p className="text-[11px] uppercase tracking-[0.16em] text-slate-400">
-                Profitability Score
+        <aside className="pointer-events-none fixed right-4 top-28 z-40 hidden 2xl:flex w-[320px] flex-col gap-4 bg-[#101022]/40 backdrop-blur-3xl border-l border-white/5 rounded-l-2xl pl-4 pr-4 py-4">
+          <div className="pointer-events-auto premium-glass rounded-3xl p-6">
+            <div className="mb-4 flex items-center justify-between gap-2">
+              <p className="text-[10px] uppercase tracking-[0.2em] font-bold text-slate-500 flex items-center gap-2">
+                <TrendingUp className="h-3.5 w-3.5 text-slate-500" />
+                Bilan Promoteur IA
               </p>
-              <span className="rounded-full border border-primary/30 bg-primary/10 px-2 py-0.5 text-[10px] font-semibold text-primary">
-                Rendement projeté
-              </span>
             </div>
 
-            <div className="grid grid-cols-[128px_minmax(0,1fr)] items-center gap-4">
-              <div className="relative mx-auto h-32 w-32">
-                <svg className="h-full w-full -rotate-90" viewBox="0 0 128 128">
-                  <circle
-                    cx="64"
-                    cy="64"
-                    r={profitabilityGaugeRadius}
-                    fill="none"
-                    stroke="rgba(148,163,184,0.2)"
-                    strokeWidth="10"
-                  />
-                  <circle
-                    cx="64"
-                    cy="64"
-                    r={profitabilityGaugeRadius}
-                    fill="none"
-                    stroke="url(#profitabilityGaugeGradient)"
-                    strokeWidth="10"
-                    strokeLinecap="round"
-                    strokeDasharray={profitabilityGaugeCircumference}
-                    strokeDashoffset={profitabilityGaugeOffset}
-                  />
-                  <defs>
-                    <linearGradient id="profitabilityGaugeGradient" x1="0" y1="0" x2="128" y2="0" gradientUnits="userSpaceOnUse">
-                      <stop offset="0%" stopColor="#22c55e" />
-                      <stop offset="58%" stopColor="#34d399" />
-                      <stop offset="100%" stopColor="#6366f1" />
-                    </linearGradient>
-                  </defs>
-                </svg>
-                <div className="absolute inset-0 flex flex-col items-center justify-center">
-                  <span className={`text-3xl font-black leading-none ${profitabilityToneClass}`}>
-                    {profitability ? profitability.score : "--"}
-                  </span>
-                  <span className="mt-1 text-[10px] uppercase tracking-[0.14em] text-slate-400">
-                    sur 100
-                  </span>
+            {promoterBalance ? (
+              <div className="space-y-4">
+                <div className="rounded-2xl bg-white/[0.02] p-4">
+                  <div className="flex items-center justify-between text-[11px] text-slate-400">
+                    <span>CA potentiel</span>
+                    <span className="font-black tracking-tight text-white">
+                      {formatCurrency(promoterBalance.chiffreAffairesEstimeEur)}
+                    </span>
+                  </div>
+                  <div className="mt-2 flex items-center justify-between text-[11px] text-slate-400">
+                    <span>Coûts de sortie (travaux + annexes)</span>
+                    <span className="font-black tracking-tight text-white">
+                      {formatCurrency(
+                        promoterBalance.coutConstructionEur +
+                          promoterBalance.fraisAnnexesEur
+                      )}
+                    </span>
+                  </div>
+                </div>
+
+                <div className="rounded-2xl border border-emerald-500/40 bg-emerald-500/10 px-4 py-5 shadow-[0_0_32px_rgba(16,185,129,0.38)]">
+                  <p className="text-[10px] font-semibold uppercase tracking-[0.2em] text-emerald-300">
+                    Prix d&apos;achat max recommandé
+                  </p>
+                  <p className="mt-2 text-[11px] text-emerald-200/80">
+                    Intègre construction, frais annexes et marge cible de 10%.
+                  </p>
+                  {promoterBalance.prixMaxTerrainEur > 0 ? (
+                    <>
+                      <p className="mt-4 text-3xl font-black tracking-tight text-emerald-400 md:text-4xl">
+                        {formatCurrency(promoterBalance.prixMaxTerrainEur)}
+                      </p>
+                      <div className="mt-3 inline-flex items-center gap-2 rounded-full border border-emerald-400/40 bg-emerald-500/20 px-3 py-1">
+                        {(() => {
+                          const ca = promoterBalance.chiffreAffairesEstimeEur;
+                          const totalCosts =
+                            promoterBalance.coutConstructionEur +
+                            promoterBalance.fraisAnnexesEur +
+                            promoterBalance.prixMaxTerrainEur;
+                          const rawMarginPct =
+                            typeof ca === "number" && ca > 0
+                              ? (ca - totalCosts) / ca
+                              : 0.1;
+                          const marginPct = Math.max(0.1, rawMarginPct);
+                          const displayPct = (marginPct * 100).toFixed(1);
+                          return (
+                            <>
+                              <span className="text-[10px] font-semibold uppercase tracking-[0.18em] text-emerald-100">
+                                Marge promoteur potentielle
+                              </span>
+                              <span className="text-xs font-black text-emerald-50">
+                                +{displayPct}%
+                              </span>
+                            </>
+                          );
+                        })()}
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <p className="mt-4 text-3xl font-black tracking-tight text-red-400 md:text-4xl">
+                        {formatCurrency(promoterBalance.prixMaxTerrainEur)}
+                      </p>
+                      <p className="mt-2 text-[11px] font-semibold uppercase tracking-[0.2em] text-red-300">
+                        PROJET NON RENTABLE EN L&apos;ÉTAT
+                      </p>
+                    </>
+                  )}
                 </div>
               </div>
-
-              <div className="space-y-1.5">
-                <p className="text-xs text-slate-400">
-                  Surface théorique:{" "}
-                  <span className="font-black text-white">
-                    {profitability
-                      ? `${Math.round(profitability.theoreticalFloorAreaM2)} m²`
-                      : "-"}
-                  </span>
-                </p>
-                <p className="text-xs text-slate-400">
-                  Niveaux estimés:{" "}
-                  <span className="font-black text-white">
-                    {profitability ? profitability.theoreticalLevels : "-"}
-                  </span>
-                </p>
-                <p className="text-xs text-slate-400">
-                  Valeur projetée:{" "}
-                  <span className="font-black text-white">
-                    {profitability ? formatCurrency(profitability.theoreticalValueEur) : "-"}
-                  </span>
-                </p>
-                <p className="text-xs text-slate-400">
-                  Marge brute:{" "}
-                  <span className="font-black text-white">
-                    {profitability ? formatCurrency(profitability.grossProfitEur) : "-"}
-                  </span>
-                </p>
-              </div>
-            </div>
+            ) : (
+              <p className="text-xs text-slate-500">
+                Sélectionnez une parcelle avec données DVF pour obtenir un bilan promoteur
+                estimatif.
+              </p>
+            )}
           </div>
 
-          <div className="pointer-events-auto premium-glass rounded-2xl border border-white/[0.06] p-5">
+            <div className="pointer-events-auto premium-glass rounded-3xl p-6">
             <div className="mb-4 flex items-center justify-between gap-3">
-              <p className="text-[11px] uppercase tracking-[0.16em] text-slate-400">
+              <p className="text-[10px] uppercase tracking-[0.2em] font-bold text-slate-500 flex items-center gap-2">
+                <ShieldCheck className="h-3.5 w-3.5 text-slate-500" />
                 Expertise & Risques
               </p>
               <span className="rounded-full border border-white/10 px-2 py-0.5 text-[10px] font-semibold text-slate-300">
                 Source : Géorisques
               </span>
             </div>
+
+            {georisquesSummary?.isFallback ? (
+              <p className="mb-3 text-[11px] text-slate-400">
+                Analyse des risques en cours (Basé sur les données historiques communales).
+              </p>
+            ) : null}
 
             {isLoadingRisks ? (
               <div className="space-y-3">

@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useState, useTransition } from "react";
 import type { ColumnDef } from "@tanstack/react-table";
-import { ArrowUpDown, ExternalLink, Star, Trash2 } from "lucide-react";
+import { ArrowUpDown, ExternalLink, Link2, Star, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { DataTable } from "@/components/ui/data-table";
 import { Badge } from "@/components/ui/badge";
@@ -25,6 +25,19 @@ interface ProjectsTableProps {
 export function ProjectsTable({ projects }: ProjectsTableProps) {
   const [rows, setRows] = useState(projects);
   const [isPending, startTransition] = useTransition();
+
+  const copyPublicLink = (projectId: string) => {
+    if (typeof window === "undefined" || typeof navigator === "undefined") return;
+    const url = `${window.location.origin}/p/${projectId}`;
+    navigator.clipboard
+      .writeText(url)
+      .then(() => {
+        toast.success("Lien public copié dans le presse-papier.");
+      })
+      .catch(() => {
+        toast.error("Impossible de copier le lien.");
+      });
+  };
 
   const togglePriority = (projectId: string) => {
     startTransition(async () => {
@@ -136,6 +149,17 @@ export function ProjectsTable({ projects }: ProjectsTableProps) {
           >
             <ArrowUpDown className="h-4 w-4" />
             Changer priorite
+          </Button>
+
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={isPending}
+            onClick={() => copyPublicLink(row.original.id)}
+            className="gap-1.5"
+          >
+            <Link2 className="h-4 w-4" />
+            Copier lien public
           </Button>
 
           <Button

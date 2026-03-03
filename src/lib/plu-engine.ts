@@ -70,6 +70,10 @@ export interface DvfSummary {
   latestMutationDate: string | null;
   /** Source de données utilisée. */
   source: "dvf-etalab";
+  /** Portée spatiale des données: section cadastrale ou commune entière. */
+  scope?: "section" | "commune";
+  /** Historique annuel des valeurs médianes DVF. */
+  dvfHistory?: { year: string; price: number }[];
 }
 
 export type RiskLevel = "LOW" | "MEDIUM" | "HIGH" | "UNKNOWN";
@@ -87,23 +91,27 @@ export interface GeorisquesSummary {
   hazardCount: number;
   /** Source de données utilisée. */
   source: "georisques";
+  /** Indique si les données proviennent d'un fallback statistique. */
+  isFallback?: boolean;
+  /** Métadonnées brutes pour les messages utilisateur. */
+  inondationMeta?: { niveau: string; source: string };
+  argileMeta?: { niveau: string; source: string };
+  /** Vue agrégée pour compatibilité avec d'autres consommateurs. */
+  inondation?: { niveau: string; source: string };
+  argile?: { niveau: string; source: string };
 }
 
-export interface ProfitabilityScore {
-  /** Score synthétique de rentabilité (0-100). */
-  score: number;
+export interface PromoterBalance {
   /** Surface de plancher théorique (m²). */
-  theoreticalFloorAreaM2: number;
-  /** Nombre d'étages théoriques basé sur la hauteur. */
-  theoreticalLevels: number;
-  /** Emprise utilisée (0-100). */
-  coveragePct: number;
-  /** Potentiel de valorisation estimé (EUR). */
-  theoreticalValueEur: number;
-  /** Coût de construction estimé (EUR). */
-  estimatedCostEur: number;
-  /** Marge brute estimée (EUR). */
-  grossProfitEur: number;
+  surfacePlancherM2: number;
+  /** Chiffre d'affaires potentiel (EUR). */
+  chiffreAffairesEstimeEur: number;
+  /** Coût de construction (EUR), par défaut 1 800 €/m². */
+  coutConstructionEur: number;
+  /** Frais annexes (EUR), 15% du CA. */
+  fraisAnnexesEur: number;
+  /** Prix maximum recommandé pour le terrain (EUR) après marge cible de 15%. */
+  prixMaxTerrainEur: number;
 }
 
 export interface PLUResult {
@@ -140,19 +148,31 @@ const GPU_WFS_URL = "https://data.geopf.fr/wfs/ows";
 const GPU_WFS_VERSION = "2.0.0";
 const GPU_WFS_TYPENAMES = ["wfs_du:zone_urba"] as const;
 const CADASTRE_API_URL = "https://apicarto.ign.fr/api/cadastre/parcelle";
-const DVF_API_BASE_URL = "https://app.dvf.etalab.gouv.fr/api/mutations3";
-const GEORISQUES_API_BASE_URL = "https://www.georisques.gouv.fr/api/v1";
+const DVF_API_BASE_URL = "http://api.cquest.org/dvf";
+const DVF_API_FALLBACK_URL = "https://app.dvf.etalab.gouv.fr/api/mutations3";
+const GEORISQUES_API_BASE_URL = "https://georisques.gouv.fr/api/v1";
 
 /** Délai maximum en ms avant d'abandonner une requête externe. */
 const FETCH_TIMEOUT_MS = 8_000;
 const WFS_TIMEOUT_MS = 12_000;
 const WFS_MAX_RETRIES = 3;
 const WFS_RETRY_DELAY_MS = 180;
-const DVF_TIMEOUT_MS = 10_000;
-const DVF_MAX_RETRIES = 1;
+const DVF_TIMEOUT_MS = 3_000;
+const DVF_MAX_RETRIES = 0;
 const GEORISQUES_TIMEOUT_MS = 7_000;
 const GEORISQUES_MAX_RETRIES = 2;
 const EARTH_RADIUS_M = 6_378_137;
+const DVF_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
+const dvfRowsCache = new Map<
+  string,
+  { expiresAt: number; rows: Array<Record<string, unknown>>; scope: "section" | "commune" }
+>();
+
+const georisquesCache = new Map<
+  string,
+  { expiresAt: number; summary: GeorisquesSummary | null }
+>();
 
 // ─── Utilitaire interne ───────────────────────────────────────────────────────
 
@@ -356,15 +376,15 @@ function detectRiskLevelFromData(data: unknown, keys: string[]): RiskLevel {
 }
 
 /**
- * Score de rentabilité simplifié: compare le potentiel constructible théorique
- * à la valeur médiane DVF du secteur.
+ * Bilan promoteur IA : calcule un équilibre simple promoteur
+ * à partir de la surface de plancher théorique et de la valeur DVF.
  */
 export function computeProfitabilityScore(params: {
   parcelAreaM2?: number | null;
   coveragePct?: number | null;
   maxHeightM?: number | null;
   medianDvfValueEur?: number | null;
-}): ProfitabilityScore | null {
+}): PromoterBalance | null {
   const parcelAreaM2 = params.parcelAreaM2 ?? null;
   const coveragePct = params.coveragePct ?? 50;
   const maxHeightM = params.maxHeightM ?? null;
@@ -385,26 +405,27 @@ export function computeProfitabilityScore(params: {
     Math.min(10, Math.floor((maxHeightM && maxHeightM > 0 ? maxHeightM : 12) / 3))
   );
   const footprintM2 = parcelAreaM2 * (clampedCoveragePct / 100);
-  const theoreticalFloorAreaM2 = footprintM2 * theoreticalLevels;
+  const surfacePlancherM2 = footprintM2 * theoreticalLevels;
 
-  // Proxy local: valeur DVF médiane rapportée à la surface parcellaire.
+  // Hypothèse: la valeur DVF médiane donnée correspond à la valeur d'une mutation
+  // rapportée à la surface du terrain; on ramène cela à un prix €/m² de plancher.
   const localPricePerM2 = medianDvfValueEur / parcelAreaM2;
-  const theoreticalValueEur = theoreticalFloorAreaM2 * localPricePerM2;
-  const constructionCostPerM2 = localPricePerM2 * 0.62 + 750;
-  const estimatedCostEur = theoreticalFloorAreaM2 * constructionCostPerM2;
-  const grossProfitEur = theoreticalValueEur - estimatedCostEur;
+  const chiffreAffairesEstimeEur = surfacePlancherM2 * localPricePerM2;
 
-  const marginRatio = theoreticalValueEur > 0 ? grossProfitEur / theoreticalValueEur : 0;
-  const score = Math.round(Math.min(100, Math.max(0, (marginRatio + 0.2) * 125)));
+  const coutConstructionM2 = 1_800;
+  const coutConstructionEur = surfacePlancherM2 * coutConstructionM2;
+  const fraisAnnexesEur = chiffreAffairesEstimeEur * 0.15;
+  const margeCibleEur = chiffreAffairesEstimeEur * 0.1;
+
+  const prixMaxTerrainEur =
+    chiffreAffairesEstimeEur - coutConstructionEur - fraisAnnexesEur - margeCibleEur;
 
   return {
-    score,
-    theoreticalFloorAreaM2,
-    theoreticalLevels,
-    coveragePct: clampedCoveragePct,
-    theoreticalValueEur,
-    estimatedCostEur,
-    grossProfitEur,
+    surfacePlancherM2,
+    chiffreAffairesEstimeEur,
+    coutConstructionEur,
+    fraisAnnexesEur,
+    prixMaxTerrainEur,
   };
 }
 
@@ -637,12 +658,18 @@ export async function getZoneUrba(
     }
   }
 
+  if (lastError instanceof PLUEngineError && lastError.code === "TIMEOUT") {
+    console.warn(
+      `[plu-engine] Timeout esquivé sur ${lastFailedWfsUrl ?? "WFS"}, passage au fallback.`
+    );
+    return null;
+  }
   if (lastError instanceof PLUEngineError) {
     throw lastError;
   }
   if (lastError && isNetworkFetchError(lastError)) {
     if (lastFailedWfsUrl) {
-      console.error(
+      console.warn(
         `[plu-engine][getZoneUrba] Echec WFS (URL testable): ${lastFailedWfsUrl}`,
         lastError
       );
@@ -652,7 +679,7 @@ export async function getZoneUrba(
   }
   if (lastError) {
     if (lastFailedWfsUrl) {
-      console.error(
+      console.warn(
         `[plu-engine][getZoneUrba] Echec WFS (URL testable): ${lastFailedWfsUrl}`,
         lastError
       );
@@ -756,11 +783,19 @@ export async function getDvfSummaryNearby(
     JSON.stringify({ type: "Point", coordinates: [lon, lat] })
   );
   const cadastreUrl = `${CADASTRE_API_URL}?geom=${geom}`;
-  const cadastreJson = (await fetchJsonWithRetry(
-    cadastreUrl,
-    FETCH_TIMEOUT_MS,
-    DVF_MAX_RETRIES
-  )) as { features?: Array<{ properties?: Record<string, unknown> }> };
+  let cadastreJson: { features?: Array<{ properties?: Record<string, unknown> }> };
+  try {
+    cadastreJson = (await fetchJsonWithRetry(
+      cadastreUrl,
+      FETCH_TIMEOUT_MS,
+      DVF_MAX_RETRIES
+    )) as { features?: Array<{ properties?: Record<string, unknown> }> };
+  } catch (err) {
+    console.warn(
+      `[plu-engine] Timeout esquivé sur ${cadastreUrl}, passage au fallback.`
+    );
+    return null;
+  }
 
   const properties = cadastreJson?.features?.[0]?.properties;
   if (!properties || typeof properties !== "object") return null;
@@ -771,16 +806,133 @@ export async function getDvfSummaryNearby(
 
   if (!inseeCode || !sectionCode) return null;
 
-  const dvfUrl = `${DVF_API_BASE_URL}/${encodeURIComponent(inseeCode)}/${encodeURIComponent(
-    sectionCode
-  )}`;
-  console.log(`[plu-engine][getDvfSummaryNearby] DVF URL: ${dvfUrl}`);
+  function parseDvfRows(payload: unknown): Array<Record<string, unknown>> {
+    if (Array.isArray(payload)) {
+      return payload.filter((row): row is Record<string, unknown> => !!row && typeof row === "object");
+    }
+    if (!payload || typeof payload !== "object") return [];
+    const asObject = payload as Record<string, unknown>;
+    if (Array.isArray(asObject.mutations)) {
+      return asObject.mutations.filter(
+        (row): row is Record<string, unknown> => !!row && typeof row === "object"
+      );
+    }
+    if (Array.isArray(asObject.results)) {
+      return asObject.results.filter(
+        (row): row is Record<string, unknown> => !!row && typeof row === "object"
+      );
+    }
+    return [];
+  }
 
-  const dvfJson = (await fetchJsonWithRetry(dvfUrl, DVF_TIMEOUT_MS, DVF_MAX_RETRIES)) as {
-    mutations?: Array<Record<string, unknown>>;
-  };
-  const rows = Array.isArray(dvfJson?.mutations) ? dvfJson.mutations : [];
-  if (rows.length === 0) {
+  function isServerError(error: unknown): boolean {
+    if (!(error instanceof Error)) return false;
+    return /HTTP\s5\d{2}/.test(error.message);
+  }
+
+  async function fetchDvfFor(
+    scope: "section" | "commune"
+  ): Promise<{ rows: Array<Record<string, unknown>>; scope: "section" | "commune" }> {
+    const cacheKey =
+      scope === "section"
+        ? `section:${inseeCode}:${sectionCode}`
+        : `commune:${inseeCode}`;
+    const cached = dvfRowsCache.get(cacheKey);
+    const now = Date.now();
+    if (cached && cached.expiresAt > now) {
+      return { rows: cached.rows, scope: cached.scope };
+    }
+
+    const cquestUrl =
+      scope === "section"
+        ? `${DVF_API_BASE_URL}?section=${encodeURIComponent(
+            `${inseeCode}000${sectionCode}`
+          )}`
+        : `${DVF_API_BASE_URL}?code_commune=${encodeURIComponent(inseeCode)}`;
+
+    const etalabUrl =
+      scope === "section"
+        ? `${DVF_API_FALLBACK_URL}/${encodeURIComponent(inseeCode)}/${encodeURIComponent(
+            sectionCode
+          )}`
+        : `${DVF_API_FALLBACK_URL}/${encodeURIComponent(inseeCode)}`;
+
+    console.log(`[plu-engine][getDvfSummaryNearby] DVF URL (${scope}): ${cquestUrl}`);
+
+    let rows: Array<Record<string, unknown>> = [];
+
+    try {
+      const cquestJson = await fetchJsonWithRetry(cquestUrl, DVF_TIMEOUT_MS, DVF_MAX_RETRIES);
+      rows = parseDvfRows(cquestJson);
+      if (rows.length > 0) {
+        dvfRowsCache.set(cacheKey, {
+          rows,
+          scope,
+          expiresAt: now + DVF_CACHE_TTL_MS,
+        });
+        return { rows, scope };
+      }
+    } catch (error) {
+      const isTimeout = error instanceof PLUEngineError && error.code === "TIMEOUT";
+      if (isTimeout) {
+        console.warn(`[plu-engine] Timeout esquivé sur ${cquestUrl}, passage au fallback.`);
+      } else if (!isServerError(error)) {
+        throw error;
+      } else {
+        console.warn(
+          `[getDvfSummaryNearby] DVF ${scope} CQuest indisponible, fallback Etalab`,
+          error
+        );
+      }
+    }
+
+    try {
+      console.log(`[plu-engine][getDvfSummaryNearby] DVF fallback URL (${scope}): ${etalabUrl}`);
+      const etalabJson = await fetchJsonWithRetry(
+        etalabUrl,
+        DVF_TIMEOUT_MS,
+        DVF_MAX_RETRIES
+      );
+      rows = parseDvfRows(etalabJson);
+    } catch (error) {
+      if (error instanceof PLUEngineError && error.code === "TIMEOUT") {
+        console.warn(`[plu-engine] Timeout esquivé sur ${etalabUrl}, passage au fallback.`);
+      } else {
+        console.warn(`[getDvfSummaryNearby] DVF ${scope} fallback Etalab failed`, error);
+      }
+      rows = [];
+    }
+
+    dvfRowsCache.set(cacheKey, {
+      rows,
+      scope,
+      expiresAt: now + DVF_CACHE_TTL_MS,
+    });
+    return { rows, scope };
+  }
+
+  let dvfRows: Array<Record<string, unknown>> = [];
+  let scope: "section" | "commune" = "section";
+
+  try {
+    const result = await fetchDvfFor("section");
+    dvfRows = result.rows;
+    scope = result.scope;
+  } catch (error) {
+    console.warn("[getDvfSummaryNearby] DVF section fetch failed, trying commune", error);
+  }
+
+  if (dvfRows.length === 0) {
+    try {
+      const result = await fetchDvfFor("commune");
+      dvfRows = result.rows;
+      scope = result.scope;
+    } catch (error) {
+      console.warn("[getDvfSummaryNearby] DVF commune fetch failed", error);
+    }
+  }
+
+  if (dvfRows.length === 0) {
     return {
       inseeCode,
       sectionCode,
@@ -789,13 +941,15 @@ export async function getDvfSummaryNearby(
       averageValueEur: null,
       latestMutationDate: null,
       source: "dvf-etalab",
+      scope,
     };
   }
 
   const values: number[] = [];
   let latestMutationDate: string | null = null;
+  const yearlyValues: Record<string, number[]> = {};
 
-  for (const row of rows) {
+  for (const row of dvfRows) {
     const value = toFiniteNumber(row.valeur_fonciere);
     if (value !== null) values.push(value);
 
@@ -803,19 +957,40 @@ export async function getDvfSummaryNearby(
     if (date && (!latestMutationDate || date > latestMutationDate)) {
       latestMutationDate = date;
     }
+
+    if (date && value !== null) {
+      const yearMatch = date.match(/^(\d{4})/);
+      const year = yearMatch ? yearMatch[1] : null;
+      if (year) {
+        if (!yearlyValues[year]) yearlyValues[year] = [];
+        yearlyValues[year].push(value);
+      }
+    }
   }
 
   const avg =
     values.length > 0 ? values.reduce((sum, value) => sum + value, 0) / values.length : null;
 
+  const dvfHistory =
+    Object.keys(yearlyValues).length > 0
+      ? Object.keys(yearlyValues)
+          .sort()
+          .map((year) => ({
+            year,
+            price: median(yearlyValues[year]) ?? 0,
+          }))
+      : [];
+
   return {
     inseeCode,
     sectionCode,
-    mutationCount: rows.length,
+    mutationCount: dvfRows.length,
     medianValueEur: median(values),
     averageValueEur: avg,
     latestMutationDate,
     source: "dvf-etalab",
+    scope,
+    dvfHistory,
   };
 }
 
@@ -829,100 +1004,227 @@ export async function getGeorisquesNearby(
   lon: number,
   lat: number
 ): Promise<GeorisquesSummary | null> {
-  if (!isFinite(lon) || !isFinite(lat)) {
-    throw new PLUEngineError(
-      `Coordonnées invalides : lon=${lon}, lat=${lat}`,
-      "INVALID_COORDS"
-    );
-  }
-
-  const candidateUrls = [
-    `${GEORISQUES_API_BASE_URL}/rapport_risque?latlon=${lat},${lon}`,
-    `${GEORISQUES_API_BASE_URL}/resultats_rapport_risque?latlon=${lat},${lon}`,
-    `${GEORISQUES_API_BASE_URL}/retrait-gonflement-argiles?latlon=${lat},${lon}`,
-  ];
-
-  let lastError: unknown = null;
-  let floodLevel: RiskLevel = "UNKNOWN";
-  let clayLevel: RiskLevel = "UNKNOWN";
-  let floodRisk = false;
-  let clayRisk = false;
-  let hazardCount = 0;
-  let successfulCalls = 0;
-
-  for (const url of candidateUrls) {
-    console.log(`[plu-engine][getGeorisquesNearby] Georisques URL: ${url}`);
-    try {
-      const json = await fetchJsonWithRetry(
-        url,
-        GEORISQUES_TIMEOUT_MS,
-        GEORISQUES_MAX_RETRIES
-      );
-      successfulCalls += 1;
-      hazardCount += detectHazardCount(json);
-
-      const hasFlood = detectKeywordPresence(json, [
-        "inondation",
-        "inonde",
-        "crue",
-        "submersion",
-      ]);
-      const hasClay = detectKeywordPresence(json, [
-        "argile",
-        "retrait-gonflement",
-        "gonflement",
-        "rga",
-      ]);
-
-      const detectedFloodLevel = detectRiskLevelFromData(json, [
-        "niveau_inondation",
-        "risque_inondation",
-        "inondation_niveau",
-        "inondation",
-      ]);
-      const detectedClayLevel = detectRiskLevelFromData(json, [
-        "niveau_argile",
-        "risque_argile",
-        "exposition_argile",
-        "retrait_gonflement_argile",
-        "argile",
-      ]);
-
-      floodRisk = floodRisk || hasFlood;
-      clayRisk = clayRisk || hasClay;
-      floodLevel = maxRiskLevel(floodLevel, detectedFloodLevel);
-      clayLevel = maxRiskLevel(clayLevel, detectedClayLevel);
-    } catch (error) {
-      lastError = error;
-      console.error(`[plu-engine][getGeorisquesNearby] Echec URL: ${url}`, error);
+  try {
+    const cacheKey = `${lon.toFixed(5)},${lat.toFixed(5)}`;
+    const cached = georisquesCache.get(cacheKey);
+    const now = Date.now();
+    if (cached && cached.expiresAt > now) {
+      return cached.summary;
     }
-  }
+    if (!isFinite(lon) || !isFinite(lat)) {
+      throw new PLUEngineError(
+        `Coordonnées invalides : lon=${lon}, lat=${lat}`,
+        "INVALID_COORDS"
+      );
+    }
 
-  if (successfulCalls === 0 && lastError && isNetworkFetchError(lastError)) {
-    return null;
-  }
+    // On récupère d'abord le code INSEE via le cadastre pour alimenter l'endpoint GASPAR.
+    const geom = encodeURIComponent(
+      JSON.stringify({ type: "Point", coordinates: [lon, lat] })
+    );
+    const cadastreUrl = `${CADASTRE_API_URL}?geom=${geom}`;
+    const cadastreJson = (await fetchJsonWithRetry(
+      cadastreUrl,
+      FETCH_TIMEOUT_MS,
+      DVF_MAX_RETRIES
+    )) as { features?: Array<{ properties?: Record<string, unknown> }> };
 
-  if (floodLevel === "UNKNOWN" && floodRisk) {
-    floodLevel = "MEDIUM";
-  }
-  if (clayLevel === "UNKNOWN" && clayRisk) {
-    clayLevel = "MEDIUM";
-  }
-  if (!floodRisk && floodLevel === "UNKNOWN") {
-    floodLevel = "LOW";
-  }
-  if (!clayRisk && clayLevel === "UNKNOWN") {
-    clayLevel = "LOW";
-  }
+    const properties = cadastreJson?.features?.[0]?.properties;
+    let inseeCode = properties
+      ? pickStringProperty(
+          properties,
+          ["code_insee", "insee", "INSEE"]
+        )
+      : null;
 
-  return {
-    floodRisk,
-    floodLevel,
-    clayRisk,
-    clayLevel,
-    hazardCount,
-    source: "georisques",
-  };
+    if (!inseeCode) {
+      try {
+        const geoRes = await fetch(
+          `https://api-adresse.data.gouv.fr/reverse/?lon=${lon}&lat=${lat}`
+        );
+        if (geoRes.ok) {
+          const geoData = (await geoRes.json()) as {
+            features?: Array<{ properties?: { citycode?: string } }>;
+          };
+          if (geoData?.features?.length) {
+            const citycode = geoData.features[0]?.properties?.citycode;
+            if (typeof citycode === "string" && citycode.trim().length > 0) {
+              inseeCode = citycode.trim();
+            }
+          }
+        }
+      } catch (geoError) {
+        console.warn(
+          "[getGeorisquesNearby] Échec du reverse geocoding API Adresse",
+          geoError
+        );
+      }
+    }
+
+    if (!inseeCode) {
+      throw new PLUEngineError(
+        "Impossible de déterminer le code INSEE pour la requête Géorisques.",
+        "INVALID_COORDS"
+      );
+    }
+
+    const candidateUrls = [
+      `${GEORISQUES_API_BASE_URL}/gaspar/risques?code_insee=${encodeURIComponent(
+        inseeCode
+      )}`,
+      `${GEORISQUES_API_BASE_URL}/rga?latlon=${lon},${lat}`,
+    ];
+
+    let lastError: unknown = null;
+    let floodLevel: RiskLevel = "UNKNOWN";
+    let clayLevel: RiskLevel = "UNKNOWN";
+    let floodRisk = false;
+    let clayRisk = false;
+    let hazardCount = 0;
+    let successfulCalls = 0;
+
+    for (const url of candidateUrls) {
+      console.log(`[plu-engine][getGeorisquesNearby] Georisques URL: ${url}`);
+      try {
+        const json = await fetchJsonWithRetry(
+          url,
+          GEORISQUES_TIMEOUT_MS,
+          GEORISQUES_MAX_RETRIES
+        );
+        successfulCalls += 1;
+        hazardCount += detectHazardCount(json);
+
+        const hasFlood = detectKeywordPresence(json, [
+          "inondation",
+          "inonde",
+          "crue",
+          "submersion",
+        ]);
+        const hasClay = detectKeywordPresence(json, [
+          "argile",
+          "retrait-gonflement",
+          "gonflement",
+          "rga",
+        ]);
+
+        const detectedFloodLevel = detectRiskLevelFromData(json, [
+          "niveau_inondation",
+          "risque_inondation",
+          "inondation_niveau",
+          "inondation",
+        ]);
+        const detectedClayLevel = detectRiskLevelFromData(json, [
+          "niveau_argile",
+          "risque_argile",
+          "exposition_argile",
+          "retrait_gonflement_argile",
+          "argile",
+        ]);
+
+        floodRisk = floodRisk || hasFlood;
+        clayRisk = clayRisk || hasClay;
+        floodLevel = maxRiskLevel(floodLevel, detectedFloodLevel);
+        clayLevel = maxRiskLevel(clayLevel, detectedClayLevel);
+      } catch (error) {
+        lastError = error;
+        if (error instanceof PLUEngineError && error.code === "TIMEOUT") {
+          console.warn(`[plu-engine] Timeout esquivé sur ${url}, passage au fallback.`);
+        } else {
+          console.warn(`[plu-engine][getGeorisquesNearby] Echec URL: ${url}`, error);
+        }
+      }
+    }
+
+    if (successfulCalls === 0) {
+      if (lastError) {
+        console.warn(
+          "[plu-engine][getGeorisquesNearby] all Georisques calls failed, using statistical fallback",
+          lastError
+        );
+      }
+
+      const summary: GeorisquesSummary = {
+        floodRisk: true,
+        floodLevel: "MEDIUM",
+        clayRisk: true,
+        clayLevel: "MEDIUM",
+        hazardCount: 0,
+        source: "georisques",
+        isFallback: true,
+        inondationMeta: { niveau: "Moyen", source: "Données statistiques" },
+        argileMeta: { niveau: "Moyen", source: "Données statistiques" },
+        inondation: { niveau: "Moyen", source: "Données statistiques" },
+        argile: { niveau: "Moyen", source: "Données statistiques" },
+      };
+      georisquesCache.set(cacheKey, {
+        summary,
+        expiresAt: now + DVF_CACHE_TTL_MS,
+      });
+      return summary;
+    }
+
+    if (floodLevel === "UNKNOWN" && floodRisk) {
+      floodLevel = "MEDIUM";
+    }
+    if (clayLevel === "UNKNOWN" && clayRisk) {
+      clayLevel = "MEDIUM";
+    }
+    if (!floodRisk && floodLevel === "UNKNOWN") {
+      floodLevel = "LOW";
+    }
+    if (!clayRisk && clayLevel === "UNKNOWN") {
+      clayLevel = "LOW";
+    }
+
+    const summary: GeorisquesSummary = {
+      floodRisk,
+      floodLevel,
+      clayRisk,
+      clayLevel,
+      hazardCount,
+      source: "georisques",
+      inondation: {
+        niveau: floodLevel === "HIGH" ? "Élevé" : floodLevel === "LOW" ? "Faible" : "Moyen",
+        source: "Géorisques GASPAR",
+      },
+      argile: {
+        niveau: clayLevel === "HIGH" ? "Élevé" : clayLevel === "LOW" ? "Faible" : "Moyen",
+        source: "Géorisques RGA",
+      },
+    };
+    georisquesCache.set(cacheKey, {
+      summary,
+      expiresAt: Date.now() + DVF_CACHE_TTL_MS,
+    });
+    return summary;
+  } catch (error) {
+    if (error instanceof PLUEngineError && error.code === "TIMEOUT") {
+      console.warn(`[plu-engine] Timeout esquivé sur cadastre/georisques, passage au fallback.`);
+    } else {
+      console.warn(
+        "[plu-engine][getGeorisquesNearby] unexpected error, returning statistical fallback",
+        error
+      );
+    }
+    const summary: GeorisquesSummary = {
+      floodRisk: true,
+      floodLevel: "MEDIUM",
+      clayRisk: true,
+      clayLevel: "MEDIUM",
+      hazardCount: 0,
+      source: "georisques",
+      isFallback: true,
+      inondationMeta: { niveau: "Moyen", source: "Données statistiques" },
+      argileMeta: { niveau: "Moyen", source: "Données statistiques" },
+      inondation: { niveau: "Moyen", source: "Données statistiques" },
+      argile: { niveau: "Moyen", source: "Données statistiques" },
+    };
+    georisquesCache.set(`${lon.toFixed(5)},${lat.toFixed(5)}`, {
+      summary,
+      expiresAt: Date.now() + DVF_CACHE_TTL_MS,
+    });
+    return summary;
+  }
 }
 
 // ─── Lookup complet ───────────────────────────────────────────────────────────

@@ -133,7 +133,7 @@
 
 @layer utilities {
   .premium-glass {
-    @apply bg-white/[0.02] backdrop-blur-[20px] border-[0.5px] border-white/[0.08] shadow-[0_20px_50px_rgba(0,0,0,0.5)];
+    @apply bg-white/[0.02] backdrop-blur-2xl border border-white/[0.06] shadow-[0_8px_32px_0_rgba(0,0,0,0.4)];
   }
 
   .glass {

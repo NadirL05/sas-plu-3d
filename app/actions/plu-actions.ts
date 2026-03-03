@@ -18,12 +18,26 @@ import {
   type AddressSuggestion,
 } from "@/src/lib/plu-engine";
 
+const ZONE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
+const zoneLookupCache = new Map<
+  string,
+  { expiresAt: number; result: { zone: ZoneUrba | null; parcel: ParcelPolygon | null } }
+>();
+
 // ─── Lookup zone (GPU WFS, côté serveur pour éviter les CORS) ─────────────────
 
 export async function lookupZoneAction(
   lon: number,
   lat: number
 ): Promise<{ zone: ZoneUrba | null; parcel: ParcelPolygon | null }> {
+  const cacheKey = `${lon.toFixed(5)},${lat.toFixed(5)}`;
+  const cached = zoneLookupCache.get(cacheKey);
+  const now = Date.now();
+  if (cached && cached.expiresAt > now) {
+    return cached.result;
+  }
+
   const zonePromise = getZoneUrba(lon, lat).catch((err) => {
     if (err instanceof TypeError) {
       console.warn("[lookupZoneAction][zone] fetch failed", err.message);
@@ -47,7 +61,14 @@ export async function lookupZoneAction(
   });
 
   const [zone, parcel] = await Promise.all([zonePromise, parcelPromise]);
-  return { zone, parcel };
+  const result = { zone, parcel };
+
+  zoneLookupCache.set(cacheKey, {
+    result,
+    expiresAt: now + ZONE_CACHE_TTL_MS,
+  });
+
+  return result;
 }
 
 export async function lookupDvfAction(
@@ -111,6 +132,7 @@ export interface SaveProjectResult {
   success: boolean;
   code?: "AUTH_REQUIRED" | "USER_NOT_FOUND" | "PROJECT_LIMIT_REACHED" | "SAVE_ERROR";
   error?: string;
+  projectId?: string;
 }
 
 export async function saveProjectAction(
@@ -166,33 +188,36 @@ export async function saveProjectAction(
       }
     }
 
-    await db.insert(projects).values({
-      name: payload.address.label,
-      userId: session.user.id,
-      metadata: {
-        address: {
-          label: payload.address.label,
-          lon: payload.address.lon,
-          lat: payload.address.lat,
-          inseeCode: payload.address.inseeCode,
-          city: payload.address.city,
-          postcode: payload.address.postcode,
+    const [inserted] = await db
+      .insert(projects)
+      .values({
+        name: payload.address.label,
+        userId: session.user.id,
+        metadata: {
+          address: {
+            label: payload.address.label,
+            lon: payload.address.lon,
+            lat: payload.address.lat,
+            inseeCode: payload.address.inseeCode,
+            city: payload.address.city,
+            postcode: payload.address.postcode,
+          },
+          zone: payload.zone
+            ? {
+                libelle: payload.zone.libelle,
+                typezone: payload.zone.typezone,
+                commune: payload.zone.commune,
+                nomfic: payload.zone.nomfic,
+                urlfic: payload.zone.urlfic,
+                datappro: payload.zone.datappro,
+              }
+            : null,
+          savedAt: new Date().toISOString(),
         },
-        zone: payload.zone
-          ? {
-              libelle: payload.zone.libelle,
-              typezone: payload.zone.typezone,
-              commune: payload.zone.commune,
-              nomfic: payload.zone.nomfic,
-              urlfic: payload.zone.urlfic,
-              datappro: payload.zone.datappro,
-            }
-          : null,
-        savedAt: new Date().toISOString(),
-      },
-    });
+      })
+      .returning({ id: projects.id });
 
-    return { success: true };
+    return { success: true, projectId: inserted?.id };
   } catch (err) {
     console.error("[saveProjectAction]", err);
     return { success: false, code: "SAVE_ERROR", error: "Erreur lors de l'enregistrement." };

@@ -1,7 +1,15 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Canvas, useThree } from "@react-three/fiber";
+import {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import {
   ContactShadows,
   Environment,
@@ -12,6 +20,7 @@ import {
 import { gsap } from "gsap";
 import * as THREE from "three";
 import type { OrbitControls as OrbitControlsImpl } from "three-stdlib";
+import { OBJExporter } from "three-stdlib";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
 import { getParcelPolygon, type ParcelGeometry } from "@/src/lib/plu-engine";
@@ -33,6 +42,10 @@ export interface ParcelSceneData {
   parcelAreaM2?: number;
 }
 
+export interface ParcelSceneHandle {
+  exportToObj: () => void;
+}
+
 interface ParcelShapeData {
   shapes: THREE.Shape[];
   width: number;
@@ -51,6 +64,8 @@ interface VisualModifiers {
   hasPrompt: boolean;
   roofStyle: RoofStyle;
   modernStyle: boolean;
+  /** Nombre d'étages explicitement demandé via le prompt (R+X), sinon null. */
+  requestedFloors: number | null;
 }
 
 function normalizePrompt(value: string): string {
@@ -79,7 +94,16 @@ function detectVisualModifiers(prompt: string): VisualModifiers {
   const modernStyle =
     normalized.includes("immeuble moderne") || normalized.includes("moderne");
 
-  return { hasPrompt, roofStyle, modernStyle };
+  let requestedFloors: number | null = null;
+  const floorsMatch = normalized.match(/r\+(\d+)/);
+  if (floorsMatch) {
+    const parsed = Number.parseInt(floorsMatch[1] ?? "", 10);
+    if (Number.isFinite(parsed) && parsed >= 0) {
+      requestedFloors = parsed + 1;
+    }
+  }
+
+  return { hasPrompt, roofStyle, modernStyle, requestedFloors };
 }
 
 function isLonLatPoint(value: unknown): value is [number, number] {
@@ -358,15 +382,24 @@ interface BuildingPreviewProps {
   maxHeight: number;
   footprintShape: ParcelShapeData;
   modifiers: VisualModifiers;
+  buildingGroupRef?: React.RefObject<THREE.Group | null>;
 }
 
 function BuildingPreview({
   maxHeight,
   footprintShape,
   modifiers,
+  buildingGroupRef,
 }: BuildingPreviewProps) {
-  const groupRef = useRef<THREE.Group>(null);
-  const bodyMaterialRef = useRef<THREE.MeshBasicMaterial>(null);
+  const FLOOR_HEIGHT = 3; // 2.8 m de mur + 0.2 m de dalle
+  const WALL_HEIGHT = 2.8;
+  const SLAB_HEIGHT = 0.2;
+
+  const localGroupRef = useRef<THREE.Group>(null);
+  const groupRef = buildingGroupRef ?? localGroupRef;
+  const bodyMaterialRef = useRef<
+    THREE.MeshPhysicalMaterial | THREE.MeshBasicMaterial
+  >(null);
   const roofMaterialRef = useRef<THREE.MeshBasicMaterial>(null);
 
   const roofThickness =
@@ -375,38 +408,81 @@ function BuildingPreview({
       : modifiers.roofStyle === "flat"
         ? 0.18
         : 0.3;
-  const baseHeight = Math.max(maxHeight - roofThickness, 2);
 
-  const bodyGeometry = useExtrudedGeometry(footprintShape.shapes, baseHeight);
-  const roofGeometry = useExtrudedGeometry(footprintShape.shapes, roofThickness);
+  // 1) Nombre maximum d'étages légal (contraint par la hauteur PLU)
+  const maxAllowedFloors = Math.max(
+    1,
+    Math.floor(maxHeight / FLOOR_HEIGHT)
+  );
+
+  const hasRequestedFloors = modifiers.requestedFloors !== null;
+
+  // 2) Nombre d'étages réellement construits
+  const actualFloors = hasRequestedFloors
+    ? Math.min(modifiers.requestedFloors as number, maxAllowedFloors)
+    : Math.max(
+        1,
+        Math.floor((maxHeight * 0.7) / FLOOR_HEIGHT)
+      );
+
+  // 3) Détection d'une infraction de hauteur
+  const isOverLimit =
+    modifiers.requestedFloors !== null &&
+    (modifiers.requestedFloors as number) > maxAllowedFloors;
+
+  const totalHeightWithoutRoof = actualFloors * FLOOR_HEIGHT;
+
+  // Géométries partagées : murs, dalles, toit
+  const floorGeometry = useExtrudedGeometry(
+    footprintShape.shapes,
+    WALL_HEIGHT
+  );
+  const slabGeometry = useExtrudedGeometry(
+    footprintShape.shapes,
+    SLAB_HEIGHT
+  );
+  const roofGeometry = useExtrudedGeometry(
+    footprintShape.shapes,
+    roofThickness
+  );
 
   const edgesGeometry = useMemo(() => {
-    return new THREE.EdgesGeometry(bodyGeometry, 25);
-  }, [bodyGeometry]);
+    return new THREE.EdgesGeometry(floorGeometry, 25);
+  }, [floorGeometry]);
 
   useEffect(() => {
     return () => {
       edgesGeometry.dispose();
+      slabGeometry.dispose();
+      roofGeometry.dispose();
     };
-  }, [edgesGeometry]);
+  }, [edgesGeometry, slabGeometry, roofGeometry]);
+
+  // Palette de couleurs en fonction du style et des contraintes
+  const facadeColorHex = isOverLimit
+    ? "#f97316" // orange/rouge d'alerte
+    : modifiers.modernStyle
+      ? "#8fa9ff"
+      : "#7f97ac";
+
+  const roofColorHex = isOverLimit
+    ? "#f97316"
+    : modifiers.roofStyle === "flat"
+      ? "#1f2329"
+      : modifiers.modernStyle
+        ? "#363b43"
+        : "#6f7f8d";
 
   useEffect(() => {
     if (!groupRef.current || !bodyMaterialRef.current) return;
 
-    const bodyColor = new THREE.Color(
-      modifiers.modernStyle ? "#2d3138" : "#7f97ac"
-    );
-    const roofColor = new THREE.Color(
-      modifiers.roofStyle === "flat"
-        ? "#1f2329"
-        : modifiers.modernStyle
-          ? "#363b43"
-          : "#6f7f8d"
-    );
+    const bodyColor = new THREE.Color(facadeColorHex);
+    const roofColor = new THREE.Color(roofColorHex);
 
     const timeline = gsap.timeline({
       defaults: { duration: 0.55, ease: "power2.out" },
     });
+
     timeline.to(
       bodyMaterialRef.current.color,
       { r: bodyColor.r, g: bodyColor.g, b: bodyColor.b },
@@ -414,7 +490,9 @@ function BuildingPreview({
     );
     timeline.to(
       bodyMaterialRef.current,
-      { opacity: modifiers.modernStyle ? 0.94 : 0.82 },
+      {
+        opacity: modifiers.modernStyle ? 0.78 : 0.86,
+      },
       0
     );
 
@@ -426,7 +504,9 @@ function BuildingPreview({
       );
       timeline.to(
         roofMaterialRef.current,
-        { opacity: modifiers.modernStyle ? 0.95 : 0.9 },
+        {
+          opacity: modifiers.modernStyle ? 0.9 : 0.94,
+        },
         0
       );
     }
@@ -448,33 +528,82 @@ function BuildingPreview({
     return () => {
       timeline.kill();
     };
-  }, [modifiers.modernStyle, modifiers.roofStyle]);
+  }, [facadeColorHex, roofColorHex, modifiers.modernStyle]);
 
   return (
     <group ref={groupRef}>
-      <mesh geometry={bodyGeometry} castShadow receiveShadow>
-        <meshBasicMaterial
-          ref={bodyMaterialRef}
-          color="#7f97ac"
-          transparent
-          opacity={0.88}
-        />
-      </mesh>
+      {/* Étages empilés */}
+      {Array.from({ length: actualFloors }).map((_, index) => {
+        const floorBaseY = FLOOR_HEIGHT * index;
 
-      <lineSegments geometry={edgesGeometry} position={[0, 0.01, 0]}>
-        <lineBasicMaterial
-          color={modifiers.modernStyle ? "#aeb6bf" : "#d5e2ec"}
-          transparent
-          opacity={0.45}
-        />
-      </lineSegments>
+        return (
+          <group key={`floor-${index}`} position={[0, floorBaseY, 0]}>
+            {/* Mur (façade) de l'étage */}
+            <mesh geometry={floorGeometry} castShadow receiveShadow>
+              {modifiers.modernStyle ? (
+                <meshPhysicalMaterial
+                  ref={index === 0 ? bodyMaterialRef : undefined}
+                  color={facadeColorHex}
+                  transparent
+                  opacity={isOverLimit ? 0.9 : 0.75}
+                  transmission={0.4}
+                  roughness={0.1}
+                  metalness={0.8}
+                />
+              ) : (
+                <meshBasicMaterial
+                  ref={index === 0 ? bodyMaterialRef : undefined}
+                  color={facadeColorHex}
+                  transparent
+                  opacity={isOverLimit ? 0.9 : 0.86}
+                />
+              )}
+            </mesh>
 
-      <mesh position={[0, baseHeight + 0.03, 0]} geometry={roofGeometry} castShadow receiveShadow>
+            {/* Dalle (plancher) juste au-dessus des murs */}
+            <mesh
+              geometry={slabGeometry}
+              position={[0, WALL_HEIGHT, 0]}
+              receiveShadow
+              castShadow
+            >
+              <meshBasicMaterial
+                color={isOverLimit ? "#fed7aa" : "#f9fafb"}
+                transparent
+                opacity={isOverLimit ? 0.95 : 0.9}
+              />
+            </mesh>
+
+            {/* Lignes de façade pour la lecture volumétrique */}
+            <lineSegments geometry={edgesGeometry} position={[0, 0.01, 0]}>
+              <lineBasicMaterial
+                color={
+                  isOverLimit
+                    ? "#fed7aa"
+                    : modifiers.modernStyle
+                      ? "#aeb6bf"
+                      : "#d5e2ec"
+                }
+                transparent
+                opacity={isOverLimit ? 0.7 : 0.45}
+              />
+            </lineSegments>
+          </group>
+        );
+      })}
+
+      {/* Toiture dynamique, posée en haut de l'empilement */}
+      <mesh
+        position={[0, totalHeightWithoutRoof, 0]}
+        geometry={roofGeometry}
+        castShadow
+        receiveShadow
+      >
         <meshBasicMaterial
           ref={roofMaterialRef}
-          color={modifiers.roofStyle === "flat" ? "#1f2329" : "#6f7f8d"}
+          color={roofColorHex}
           transparent
-          opacity={0.9}
+          opacity={modifiers.modernStyle ? 0.9 : 0.96}
         />
       </mesh>
     </group>
@@ -789,12 +918,14 @@ function SceneContent({
   sunTime,
   mapZoom,
   onCaptureReady,
+  buildingGroupRef,
 }: {
   data: ParcelSceneData | null;
   modifiers: VisualModifiers;
   sunTime: number;
   mapZoom?: number;
   onCaptureReady?: (capture: () => string | null) => void;
+  buildingGroupRef?: React.RefObject<THREE.Group | null>;
 }) {
   const controlsRef = useRef<OrbitControlsImpl | null>(null);
 
@@ -828,6 +959,64 @@ function SceneContent({
     [sunTime, focus?.center]
   );
 
+  function DynamicSun({
+    sunTime,
+    focus,
+    intensity,
+  }: {
+    sunTime: number;
+    focus: SceneFocus | null;
+    intensity: number;
+  }) {
+    const lightRef = useRef<THREE.DirectionalLight | null>(null);
+    const targetRef = useRef<THREE.Object3D | null>(null);
+
+    const targetPosition = useMemo(() => {
+      const center = focus?.center ?? new THREE.Vector3(0, 0, 0);
+      const sunAngle = ((sunTime - 6) / 14) * Math.PI;
+      const radius = Math.max(40, Math.max(focus?.width ?? 20, focus?.depth ?? 20) * 1.2);
+      const x = center.x + Math.cos(sunAngle) * -radius;
+      const y = center.y + Math.max(Math.sin(sunAngle) * radius, 8);
+      const z = center.z + Math.sin(sunAngle) * radius;
+      return new THREE.Vector3(x, y, z);
+    }, [sunTime, focus?.center, focus?.width, focus?.depth]);
+
+    const targetCenter = useMemo(() => {
+      const center = focus?.center ?? new THREE.Vector3(0, 0, 0);
+      return new THREE.Vector3(center.x, 0, center.z);
+    }, [focus?.center]);
+
+    useFrame(() => {
+      if (lightRef.current) {
+        lightRef.current.position.lerp(targetPosition, 0.05);
+      }
+      if (targetRef.current) {
+        targetRef.current.position.lerp(targetCenter, 0.05);
+      }
+    });
+
+    const lightFrustum = focus
+      ? Math.max(20, Math.ceil(Math.max(focus.width, focus.depth) * 1.4))
+      : 20;
+
+    return (
+      <directionalLight
+        ref={lightRef}
+        intensity={intensity}
+        castShadow
+        shadow-mapSize={[2048, 2048]}
+        shadow-bias={-0.0001}
+        shadow-camera-far={70}
+        shadow-camera-left={-lightFrustum}
+        shadow-camera-right={lightFrustum}
+        shadow-camera-top={lightFrustum}
+        shadow-camera-bottom={-lightFrustum}
+      >
+        <object3D ref={targetRef} attach="target" />
+      </directionalLight>
+    );
+  }
+
   function CaptureBridge({
     onReady,
   }: {
@@ -859,22 +1048,7 @@ function SceneContent({
 
       <ambientLight intensity={0.35} />
       <SoftShadows size={40} samples={32} focus={0.9} />
-      <directionalLight
-        position={sun.position}
-        intensity={sun.intensity}
-        castShadow
-        shadow-mapSize={[1024, 1024]}
-        shadow-camera-far={70}
-        shadow-camera-left={-lightFrustum}
-        shadow-camera-right={lightFrustum}
-        shadow-camera-top={lightFrustum}
-        shadow-camera-bottom={-lightFrustum}
-      >
-        <object3D
-          attach="target"
-          position={[focus?.center.x ?? 0, 0, focus?.center.z ?? 0]}
-        />
-      </directionalLight>
+      <DynamicSun sunTime={sunTime} focus={focus} intensity={sun.intensity} />
       <Environment preset="city" blur={0.75} />
 
       {data ? (
@@ -925,6 +1099,7 @@ function SceneContent({
           maxHeight={data.maxHeight}
           footprintShape={footprintShape}
           modifiers={modifiers}
+          buildingGroupRef={buildingGroupRef}
         />
       ) : null}
     </>
@@ -947,133 +1122,169 @@ interface ParcelSceneProps {
   onCaptureReady?: (capture: () => string | null) => void;
 }
 
-export function ParcelScene({
-  pluData,
-  className,
-  promptValue,
-  hidePromptInput = false,
-  fillContainer = false,
-  mapZoom,
-  sunTime,
-  onPromptChange,
-  onCaptureReady,
-}: ParcelSceneProps) {
-  const [prompt, setPrompt] = useState("");
-  const [modifiers, setModifiers] = useState<VisualModifiers>(() =>
-    detectVisualModifiers("")
-  );
-  const [resolvedParcelPolygon, setResolvedParcelPolygon] =
-    useState<ParcelGeometry | undefined>(pluData?.parcelPolygon);
-  const captureRef = useRef<(() => string | null) | null>(null);
+export const ParcelScene = forwardRef<ParcelSceneHandle, ParcelSceneProps>(
+  function ParcelScene(
+    {
+      pluData,
+      className,
+      promptValue,
+      hidePromptInput = false,
+      fillContainer = false,
+      mapZoom,
+      sunTime,
+      onPromptChange,
+      onCaptureReady,
+    }: ParcelSceneProps,
+    ref
+  ) {
+    const [prompt, setPrompt] = useState("");
+    const [modifiers, setModifiers] = useState<VisualModifiers>(() =>
+      detectVisualModifiers("")
+    );
+    const [resolvedParcelPolygon, setResolvedParcelPolygon] =
+      useState<ParcelGeometry | undefined>(pluData?.parcelPolygon);
+    const captureRef = useRef<(() => string | null) | null>(null);
+    const buildingGroupRef = useRef<THREE.Group | null>(null);
 
-  const handleCaptureReady = useCallback(
-    (capture: () => string | null) => {
-      captureRef.current = capture;
-      if (!onCaptureReady) return;
-      onCaptureReady(() => captureRef.current?.() ?? null);
-    },
-    [onCaptureReady]
-  );
+    const handleExportToObj = useCallback(() => {
+      if (!buildingGroupRef.current) return;
+      try {
+        const exporter = new OBJExporter();
+        const result = exporter.parse(buildingGroupRef.current);
+        if (!result) return;
 
-  useEffect(() => {
-    setModifiers(detectVisualModifiers(prompt));
-  }, [prompt]);
+        const blob = new Blob([result], { type: "text/plain" });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = "sas-plu-3d-building.obj";
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
+      } catch {
+        // En cas d'erreur d'export, on ne casse pas l'expérience utilisateur.
+      }
+    }, []);
 
-  useEffect(() => {
-    if (!onPromptChange) return;
-    onPromptChange(prompt);
-  }, [prompt, onPromptChange]);
+    useImperativeHandle(
+      ref,
+      () => ({
+        exportToObj: handleExportToObj,
+      }),
+      [handleExportToObj]
+    );
 
-  useEffect(() => {
-    if (typeof promptValue !== "string") return;
-    if (promptValue === prompt) return;
-    setPrompt(promptValue);
-  }, [promptValue, prompt]);
+    const handleCaptureReady = useCallback(
+      (capture: () => string | null) => {
+        captureRef.current = capture;
+        if (!onCaptureReady) return;
+        onCaptureReady(() => captureRef.current?.() ?? null);
+      },
+      [onCaptureReady]
+    );
 
-  useEffect(() => {
-    setResolvedParcelPolygon(pluData?.parcelPolygon);
-  }, [pluData?.parcelPolygon]);
+    useEffect(() => {
+      setModifiers(detectVisualModifiers(prompt));
+    }, [prompt]);
 
-  useEffect(() => {
-    const lon = pluData?.parcelCenter?.lon;
-    const lat = pluData?.parcelCenter?.lat;
+    useEffect(() => {
+      if (!onPromptChange) return;
+      onPromptChange(prompt);
+    }, [prompt, onPromptChange]);
 
-    if (typeof lon !== "number" || typeof lat !== "number") {
-      return;
-    }
+    useEffect(() => {
+      if (typeof promptValue !== "string") return;
+      if (promptValue === prompt) return;
+      setPrompt(promptValue);
+    }, [promptValue, prompt]);
 
-    let cancelled = false;
+    useEffect(() => {
+      setResolvedParcelPolygon(pluData?.parcelPolygon);
+    }, [pluData?.parcelPolygon]);
 
-    getParcelPolygon(lon, lat)
-      .then((parcel) => {
-        if (cancelled || !parcel?.geometry) return;
-        setResolvedParcelPolygon(parcel.geometry);
-      })
-      .catch(() => {
-        // On garde la géométrie déjà disponible (lookup serveur ou fallback footprint).
-      });
+    useEffect(() => {
+      const lon = pluData?.parcelCenter?.lon;
+      const lat = pluData?.parcelCenter?.lat;
 
-    return () => {
-      cancelled = true;
-    };
-  }, [pluData?.parcelCenter?.lon, pluData?.parcelCenter?.lat]);
+      if (typeof lon !== "number" || typeof lat !== "number") {
+        return;
+      }
 
-  const sceneData = useMemo<ParcelSceneData | null>(() => {
-    if (!pluData) return null;
+      let cancelled = false;
 
-    return {
-      ...pluData,
-      parcelPolygon: resolvedParcelPolygon ?? pluData.parcelPolygon,
-    };
-  }, [pluData, resolvedParcelPolygon]);
+      getParcelPolygon(lon, lat)
+        .then((parcel) => {
+          if (cancelled || !parcel?.geometry) return;
+          setResolvedParcelPolygon(parcel.geometry);
+        })
+        .catch(() => {
+          // On garde la géométrie déjà disponible (lookup serveur ou fallback footprint).
+        });
 
-  const effectiveSunTime = useMemo(() => {
-    if (typeof sunTime === "number" && Number.isFinite(sunTime)) {
-      return Math.min(24, Math.max(0, sunTime));
-    }
-    return 14;
-  }, [sunTime]);
+      return () => {
+        cancelled = true;
+      };
+    }, [pluData?.parcelCenter?.lon, pluData?.parcelCenter?.lat]);
 
-  return (
-    <div className={cn("w-full", fillContainer ? "h-full" : "space-y-3")}>
-      <div
-        className={cn(
-          "relative w-full rounded-xl border border-border bg-transparent overflow-hidden",
-          fillContainer ? "h-full aspect-auto" : "aspect-video",
-          className
-        )}
-      >
-        <Canvas
-          shadows
-          camera={{ position: [12, 8, 12], fov: 45 }}
-          gl={{ antialias: true, alpha: true, preserveDrawingBuffer: true }}
-          onCreated={({ gl }) => {
-            gl.setClearColor(0x000000, 0);
-          }}
+    const sceneData = useMemo<ParcelSceneData | null>(() => {
+      if (!pluData) return null;
+
+      return {
+        ...pluData,
+        parcelPolygon: resolvedParcelPolygon ?? pluData.parcelPolygon,
+      };
+    }, [pluData, resolvedParcelPolygon]);
+
+    const effectiveSunTime = useMemo(() => {
+      if (typeof sunTime === "number" && Number.isFinite(sunTime)) {
+        return Math.min(24, Math.max(0, sunTime));
+      }
+      return 14;
+    }, [sunTime]);
+
+    return (
+      <div className={cn("w-full", fillContainer ? "h-full" : "space-y-3")}>
+        <div
+          className={cn(
+            "relative w-full rounded-xl border border-border bg-transparent overflow-hidden",
+            fillContainer ? "h-full aspect-auto" : "aspect-video",
+            className
+          )}
         >
-          <SceneContent
-            data={sceneData}
-            modifiers={modifiers}
-            sunTime={effectiveSunTime}
-            mapZoom={mapZoom}
-            onCaptureReady={handleCaptureReady}
-          />
-        </Canvas>
-      </div>
-
-      {!hidePromptInput ? (
-        <div className="space-y-2">
-          <p className="text-sm font-medium text-foreground">
-            Personnaliser la construction
-          </p>
-          <Input
-            value={prompt}
-            onChange={(e) => setPrompt(e.target.value)}
-            placeholder="Ex: Toit terrasse, Toit en pente, Immeuble moderne"
-            disabled={!pluData}
-          />
+          <Canvas
+            shadows
+            camera={{ position: [12, 8, 12], fov: 45 }}
+            gl={{ antialias: true, alpha: true, preserveDrawingBuffer: true }}
+            onCreated={({ gl }) => {
+              gl.setClearColor(0x000000, 0);
+            }}
+          >
+            <SceneContent
+              data={sceneData}
+              modifiers={modifiers}
+              sunTime={effectiveSunTime}
+              mapZoom={mapZoom}
+              onCaptureReady={handleCaptureReady}
+              buildingGroupRef={buildingGroupRef}
+            />
+          </Canvas>
         </div>
-      ) : null}
-    </div>
-  );
-}
+
+        {!hidePromptInput ? (
+          <div className="space-y-2">
+            <p className="text-sm font-medium text-foreground">
+              Personnaliser la construction
+            </p>
+            <Input
+              value={prompt}
+              onChange={(e) => setPrompt(e.target.value)}
+              placeholder="Ex: Toit terrasse, Toit en pente, Immeuble moderne"
+              disabled={!pluData}
+            />
+          </div>
+        ) : null}
+      </div>
+    );
+  }
+);
