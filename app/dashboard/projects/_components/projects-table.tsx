@@ -172,6 +172,13 @@ export function ProjectsTable({ projects }: ProjectsTableProps) {
             <Trash2 className="h-4 w-4" />
             Supprimer
           </Button>
+
+          <Button asChild variant="ghost" size="sm" className="gap-1.5 text-xs">
+            <Link href={`/dashboard/projects/${row.original.id}`}>
+              Voir le pipeline
+              <ExternalLink className="h-3.5 w-3.5" />
+            </Link>
+          </Button>
         </div>
       ),
     },

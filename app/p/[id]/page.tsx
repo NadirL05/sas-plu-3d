@@ -1,9 +1,16 @@
 import Link from "next/link";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { notFound } from "next/navigation";
 import { db } from "@/src/db";
-import { projects } from "@/src/db/schema";
-import type { ZoneUrba, AddressSuggestion } from "@/src/lib/plu-engine";
+import { feasibilityStudy, projects } from "@/src/db/schema";
+import type {
+  ZoneUrba,
+  AddressSuggestion,
+  ParcelPolygon,
+  DvfSummary,
+  GeorisquesSummary,
+  PromoterBalance,
+} from "@/src/lib/plu-engine";
 import type { ParcelSceneData } from "@/components/three/ParcelScene";
 import { ParcelScene } from "@/components/three/ParcelScene";
 
@@ -67,6 +74,153 @@ export default async function DealRoomPage({ params }: DealRoomPageProps) {
   }
 
   const id = params.id;
+
+  // 1) Tenter de résoudre un partage public d'étude de faisabilité via publicShareId.
+  const [publicStudyRow] = await db
+    .select({
+      id: feasibilityStudy.id,
+      address: feasibilityStudy.address,
+      lon: feasibilityStudy.lon,
+      lat: feasibilityStudy.lat,
+      inseeCode: feasibilityStudy.inseeCode,
+      zoning: feasibilityStudy.zoning,
+      parcel: feasibilityStudy.parcel,
+      dvfSummary: feasibilityStudy.dvfSummary,
+      georisquesSummary: feasibilityStudy.georisquesSummary,
+      promoterBalance: feasibilityStudy.promoterBalance,
+      publicShareEnabled: feasibilityStudy.publicShareEnabled,
+    })
+    .from(feasibilityStudy)
+    .where(and(eq(feasibilityStudy.publicShareId, id), eq(feasibilityStudy.publicShareEnabled, true)))
+    .limit(1);
+
+  if (publicStudyRow) {
+    const zoning = publicStudyRow.zoning as ZoneUrba | null;
+    const parcel = publicStudyRow.parcel as ParcelPolygon | null;
+    const dvf = publicStudyRow.dvfSummary as DvfSummary | null;
+    const risks = publicStudyRow.georisquesSummary as GeorisquesSummary | null;
+    const promoter = publicStudyRow.promoterBalance as PromoterBalance | null;
+
+    const address: AddressSuggestion = {
+      label: publicStudyRow.address,
+      lon: Number(publicStudyRow.lon ?? 0),
+      lat: Number(publicStudyRow.lat ?? 0),
+      inseeCode: publicStudyRow.inseeCode ?? "",
+      city: "",
+      postcode: "",
+      score: 1,
+    };
+
+    return (
+      <div className="min-h-screen bg-background-dark text-slate-100">
+        <header className="border-b border-white/10 bg-black/70 backdrop-blur-2xl">
+          <div className="mx-auto flex max-w-5xl items-center justify-between px-4 py-3 text-xs">
+            <span className="text-slate-400">
+              Étude de faisabilité partagée via{" "}
+              <span className="font-semibold text-white">SAS PLU 3D</span>
+            </span>
+            <Link
+              href="/"
+              className="text-emerald-400 hover:text-emerald-300 text-xs font-semibold"
+            >
+              Créer mon compte
+            </Link>
+          </div>
+        </header>
+        <main className="mx-auto flex max-w-5xl flex-col gap-5 px-4 py-8 md:py-10">
+          <section className="space-y-1">
+            <p className="text-[11px] uppercase tracking-[0.18em] text-slate-400">
+              Étude de faisabilité • Lien public
+            </p>
+            <h1 className="text-2xl font-semibold tracking-tight text-white md:text-3xl">
+              {address.label}
+            </h1>
+          </section>
+
+          <section className="grid gap-4 md:grid-cols-2">
+            <div className="rounded-2xl border border-white/[0.08] bg-slate-950/80 p-4">
+              <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
+                Adresse & localisation
+              </p>
+              <p className="mt-2 text-sm font-medium text-slate-100">{address.label}</p>
+              <p className="mt-1 text-xs text-slate-400">
+                Coordonnées :{" "}
+                <span className="font-mono text-slate-200">
+                  {Number.isFinite(address.lat) && Number.isFinite(address.lon)
+                    ? `${address.lat.toFixed(5)}, ${address.lon.toFixed(5)}`
+                    : "Non disponibles"}
+                </span>
+              </p>
+              <p className="mt-1 text-xs text-slate-400">
+                Code INSEE :{" "}
+                <span className="font-mono text-slate-200">
+                  {address.inseeCode || "Non renseigné"}
+                </span>
+              </p>
+            </div>
+
+            <div className="rounded-2xl border border-white/[0.08] bg-slate-950/80 p-4">
+              <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
+                Urbanisme (PLU)
+              </p>
+              <p className="mt-2 text-xs text-slate-400">
+                Zonage :{" "}
+                <span className="font-semibold text-slate-100">
+                  {zoning?.libelle ?? zoning?.typezone ?? "Non renseigné"}
+                </span>
+              </p>
+              <p className="mt-1 text-xs text-slate-400">
+                Type de zone :{" "}
+                <span className="font-mono text-slate-200">
+                  {zoning?.typezone ?? "Non renseigné"}
+                </span>
+              </p>
+            </div>
+          </section>
+
+          <section className="grid gap-4 md:grid-cols-2">
+            <div className="rounded-2xl border border-white/[0.08] bg-slate-950/80 p-4">
+              <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
+                Parcelle cadastrale
+              </p>
+              <p className="mt-2 text-xs text-slate-400">
+                Surface :{" "}
+                <span className="font-semibold text-slate-100">
+                  {parcel?.areaM2 ? `${parcel.areaM2.toFixed(1)} m²` : "Non renseignée"}
+                </span>
+              </p>
+            </div>
+
+            <div className="rounded-2xl border border-white/[0.08] bg-slate-950/80 p-4">
+              <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
+                Bilan promoteur (synthèse)
+              </p>
+              <p className="mt-2 text-xs text-slate-400">
+                Prix d&apos;achat max terrain :{" "}
+                <span
+                  className={`font-semibold ${
+                    promoter && promoter.prixMaxTerrainEur > 0
+                      ? "text-emerald-400"
+                      : "text-red-400"
+                  }`}
+                >
+                  {promoter
+                    ? new Intl.NumberFormat("fr-FR", {
+                        style: "currency",
+                        currency: "EUR",
+                        maximumFractionDigits: 0,
+                      }).format(promoter.prixMaxTerrainEur)
+                    : "-"}
+                </span>
+              </p>
+            </div>
+          </section>
+        </main>
+      </div>
+    );
+  }
+
+  // 2) Sinon, fallback sur la Deal Room projet historique (partage par projet).
 
   const [project] = await db
     .select({

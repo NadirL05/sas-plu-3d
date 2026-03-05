@@ -15,7 +15,6 @@ import {
   Environment,
   Grid,
   OrbitControls,
-  SoftShadows,
 } from "@react-three/drei";
 import { gsap } from "gsap";
 import * as THREE from "three";
@@ -40,10 +39,15 @@ export interface ParcelSceneData {
   parcelCenter?: { lon: number; lat: number };
   /** Surface de la parcelle en m² (si disponible). */
   parcelAreaM2?: number;
+  /** Style de toiture recommandé par l'IA. */
+  roofType?: "flat" | "sloped";
+  /** Présence d'un rez-de-chaussée commercial recommandée par l'IA. */
+  hasCommercialGround?: boolean;
 }
 
 export interface ParcelSceneHandle {
   exportToObj: () => void;
+  buildingTypology?: "massing" | "house" | "collective" | "mixed";
 }
 
 interface ParcelShapeData {
@@ -378,234 +382,116 @@ function useExtrudedGeometry(shapes: THREE.Shape[], height: number): THREE.Extru
   return geometry;
 }
 
+function scaleShapes(shapes: THREE.Shape[], scale: number): THREE.Shape[] {
+  return shapes.map((shape) => {
+    const extracted = shape.extractPoints(16);
+    const contour = extracted.shape.map(
+      (point) => new THREE.Vector2(point.x * scale, point.y * scale)
+    );
+    const scaledShape = new THREE.Shape(contour);
+
+    for (const hole of extracted.holes) {
+      const holePoints = hole.map(
+        (point) => new THREE.Vector2(point.x * scale, point.y * scale)
+      );
+      scaledShape.holes.push(new THREE.Path(holePoints));
+    }
+
+    return scaledShape;
+  });
+}
+
 interface BuildingPreviewProps {
   maxHeight: number;
   footprintShape: ParcelShapeData;
-  modifiers: VisualModifiers;
+  buildingTypology?: "massing" | "house" | "collective" | "mixed";
   buildingGroupRef?: React.RefObject<THREE.Group | null>;
 }
 
 function BuildingPreview({
   maxHeight,
   footprintShape,
-  modifiers,
+  buildingTypology = "collective",
   buildingGroupRef,
 }: BuildingPreviewProps) {
-  const FLOOR_HEIGHT = 3; // 2.8 m de mur + 0.2 m de dalle
-  const WALL_HEIGHT = 2.8;
+  const FLOOR_HEIGHT = 3;
+  const WALL_HEIGHT = FLOOR_HEIGHT - 0.2;
   const SLAB_HEIGHT = 0.2;
-
   const localGroupRef = useRef<THREE.Group>(null);
   const groupRef = buildingGroupRef ?? localGroupRef;
-  const bodyMaterialRef = useRef<
-    THREE.MeshPhysicalMaterial | THREE.MeshBasicMaterial
-  >(null);
-  const roofMaterialRef = useRef<THREE.MeshBasicMaterial>(null);
+  const effectiveHeight = Math.max(0.2, maxHeight);
+  const maxFloors = Math.max(1, Math.floor(effectiveHeight / FLOOR_HEIGHT));
+  const numFloors = buildingTypology === "house" ? Math.min(maxFloors, 2) : maxFloors;
 
-  const roofThickness =
-    modifiers.roofStyle === "slope"
-      ? Math.max(maxHeight * 0.08, 0.55)
-      : modifiers.roofStyle === "flat"
-        ? 0.18
-        : 0.3;
-
-  // 1) Nombre maximum d'étages légal (contraint par la hauteur PLU)
-  const maxAllowedFloors = Math.max(
-    1,
-    Math.floor(maxHeight / FLOOR_HEIGHT)
-  );
-
-  const hasRequestedFloors = modifiers.requestedFloors !== null;
-
-  // 2) Nombre d'étages réellement construits
-  const actualFloors = hasRequestedFloors
-    ? Math.min(modifiers.requestedFloors as number, maxAllowedFloors)
-    : Math.max(
-        1,
-        Math.floor((maxHeight * 0.7) / FLOOR_HEIGHT)
-      );
-
-  // 3) Détection d'une infraction de hauteur
-  const isOverLimit =
-    modifiers.requestedFloors !== null &&
-    (modifiers.requestedFloors as number) > maxAllowedFloors;
-
-  const totalHeightWithoutRoof = actualFloors * FLOOR_HEIGHT;
-
-  // Géométries partagées : murs, dalles, toit
-  const floorGeometry = useExtrudedGeometry(
-    footprintShape.shapes,
-    WALL_HEIGHT
-  );
-  const slabGeometry = useExtrudedGeometry(
-    footprintShape.shapes,
-    SLAB_HEIGHT
-  );
-  const roofGeometry = useExtrudedGeometry(
-    footprintShape.shapes,
-    roofThickness
-  );
-
-  const edgesGeometry = useMemo(() => {
-    return new THREE.EdgesGeometry(floorGeometry, 25);
-  }, [floorGeometry]);
+  const slabShapes = useMemo(() => scaleShapes(footprintShape.shapes, 1.02), [footprintShape.shapes]);
+  const massingGeometry = useExtrudedGeometry(footprintShape.shapes, effectiveHeight);
+  const floorGeometry = useExtrudedGeometry(footprintShape.shapes, WALL_HEIGHT);
+  const slabGeometry = useExtrudedGeometry(slabShapes, SLAB_HEIGHT);
 
   useEffect(() => {
-    return () => {
-      edgesGeometry.dispose();
-      slabGeometry.dispose();
-      roofGeometry.dispose();
-    };
-  }, [edgesGeometry, slabGeometry, roofGeometry]);
-
-  // Palette de couleurs en fonction du style et des contraintes
-  const facadeColorHex = isOverLimit
-    ? "#f97316" // orange/rouge d'alerte
-    : modifiers.modernStyle
-      ? "#8fa9ff"
-      : "#7f97ac";
-
-  const roofColorHex = isOverLimit
-    ? "#f97316"
-    : modifiers.roofStyle === "flat"
-      ? "#1f2329"
-      : modifiers.modernStyle
-        ? "#363b43"
-        : "#6f7f8d";
-
-  useEffect(() => {
-    if (!groupRef.current || !bodyMaterialRef.current) return;
-
-    const bodyColor = new THREE.Color(facadeColorHex);
-    const roofColor = new THREE.Color(roofColorHex);
-
-    const timeline = gsap.timeline({
-      defaults: { duration: 0.55, ease: "power2.out" },
-    });
-
-    timeline.to(
-      bodyMaterialRef.current.color,
-      { r: bodyColor.r, g: bodyColor.g, b: bodyColor.b },
-      0
-    );
-    timeline.to(
-      bodyMaterialRef.current,
-      {
-        opacity: modifiers.modernStyle ? 0.78 : 0.86,
-      },
-      0
-    );
-
-    if (roofMaterialRef.current) {
-      timeline.to(
-        roofMaterialRef.current.color,
-        { r: roofColor.r, g: roofColor.g, b: roofColor.b },
-        0
-      );
-      timeline.to(
-        roofMaterialRef.current,
-        {
-          opacity: modifiers.modernStyle ? 0.9 : 0.94,
-        },
-        0
-      );
-    }
+    if (!groupRef.current) return;
+    const timeline = gsap.timeline({ defaults: { duration: 0.45, ease: "power2.out" } });
 
     timeline.fromTo(
       groupRef.current.scale,
-      { x: 0.95, y: 0.95, z: 0.95 },
-      { x: 1, y: 1, z: 1, duration: 0.7, ease: "power3.out" },
+      { x: 0.96, y: 0.96, z: 0.96 },
+      { x: 1, y: 1, z: 1 },
       0
     );
-
     timeline.fromTo(
       groupRef.current.position,
-      { y: -0.15 },
-      { y: 0, duration: 0.65, ease: "back.out(1.4)" },
+      { y: -0.1 },
+      { y: 0, ease: "back.out(1.25)" },
       0
     );
 
     return () => {
       timeline.kill();
     };
-  }, [facadeColorHex, roofColorHex, modifiers.modernStyle]);
+  }, [buildingTypology, effectiveHeight, numFloors, groupRef]);
 
   return (
     <group ref={groupRef}>
-      {/* Étages empilés */}
-      {Array.from({ length: actualFloors }).map((_, index) => {
-        const floorBaseY = FLOOR_HEIGHT * index;
+      {buildingTypology === "massing" ? (
+        <mesh geometry={massingGeometry} castShadow receiveShadow>
+          <meshStandardMaterial
+            color="#60a5fa"
+            transparent
+            opacity={0.38}
+            roughness={0.55}
+            metalness={0.1}
+          />
+        </mesh>
+      ) : (
+        Array.from({ length: numFloors }).map((_, index) => {
+          const isMixedGround = buildingTypology === "mixed" && index === 0;
+          const floorBaseY = FLOOR_HEIGHT * index;
 
-        return (
-          <group key={`floor-${index}`} position={[0, floorBaseY, 0]}>
-            {/* Mur (façade) de l'étage */}
-            <mesh geometry={floorGeometry} castShadow receiveShadow>
-              {modifiers.modernStyle ? (
-                <meshPhysicalMaterial
-                  ref={index === 0 ? bodyMaterialRef : undefined}
-                  color={facadeColorHex}
-                  transparent
-                  opacity={isOverLimit ? 0.9 : 0.75}
-                  transmission={0.4}
-                  roughness={0.1}
-                  metalness={0.8}
-                />
-              ) : (
-                <meshBasicMaterial
-                  ref={index === 0 ? bodyMaterialRef : undefined}
-                  color={facadeColorHex}
-                  transparent
-                  opacity={isOverLimit ? 0.9 : 0.86}
-                />
-              )}
-            </mesh>
-
-            {/* Dalle (plancher) juste au-dessus des murs */}
-            <mesh
-              geometry={slabGeometry}
-              position={[0, WALL_HEIGHT, 0]}
-              receiveShadow
-              castShadow
-            >
-              <meshBasicMaterial
-                color={isOverLimit ? "#fed7aa" : "#f9fafb"}
-                transparent
-                opacity={isOverLimit ? 0.95 : 0.9}
-              />
-            </mesh>
-
-            {/* Lignes de façade pour la lecture volumétrique */}
-            <lineSegments geometry={edgesGeometry} position={[0, 0.01, 0]}>
-              <lineBasicMaterial
-                color={
-                  isOverLimit
-                    ? "#fed7aa"
-                    : modifiers.modernStyle
-                      ? "#aeb6bf"
-                      : "#d5e2ec"
-                }
-                transparent
-                opacity={isOverLimit ? 0.7 : 0.45}
-              />
-            </lineSegments>
-          </group>
-        );
-      })}
-
-      {/* Toiture dynamique, posée en haut de l'empilement */}
-      <mesh
-        position={[0, totalHeightWithoutRoof, 0]}
-        geometry={roofGeometry}
-        castShadow
-        receiveShadow
-      >
-        <meshBasicMaterial
-          ref={roofMaterialRef}
-          color={roofColorHex}
-          transparent
-          opacity={modifiers.modernStyle ? 0.9 : 0.96}
-        />
-      </mesh>
+          return (
+            <group key={`floor-${index}`} position={[0, floorBaseY, 0]}>
+              <mesh geometry={floorGeometry} castShadow receiveShadow>
+                {isMixedGround ? (
+                  <meshPhysicalMaterial
+                    color="#1e293b"
+                    roughness={0.1}
+                    metalness={0.35}
+                    clearcoat={0.25}
+                  />
+                ) : (
+                  <meshStandardMaterial
+                    color="#f8fafc"
+                    roughness={0.9}
+                    metalness={0.05}
+                  />
+                )}
+              </mesh>
+              <mesh geometry={slabGeometry} position={[0, WALL_HEIGHT, 0]} castShadow receiveShadow>
+                <meshStandardMaterial color="#d1d5db" roughness={0.45} metalness={0.08} />
+              </mesh>
+            </group>
+          );
+        })
+      )}
     </group>
   );
 }
@@ -915,6 +801,7 @@ function ParcelTrees({ shape }: { shape: ParcelShapeData }) {
 function SceneContent({
   data,
   modifiers,
+  buildingTypology,
   sunTime,
   mapZoom,
   onCaptureReady,
@@ -922,6 +809,7 @@ function SceneContent({
 }: {
   data: ParcelSceneData | null;
   modifiers: VisualModifiers;
+  buildingTypology?: "massing" | "house" | "collective" | "mixed";
   sunTime: number;
   mapZoom?: number;
   onCaptureReady?: (capture: () => string | null) => void;
@@ -951,13 +839,11 @@ function SceneContent({
   const gridSize = focus
     ? Math.max(30, Math.ceil(Math.max(focus.width, focus.depth) * 2.5))
     : 30;
-  const lightFrustum = focus
-    ? Math.max(20, Math.ceil(Math.max(focus.width, focus.depth) * 1.4))
-    : 20;
   const sun = useMemo(
     () => getSunSettings(sunTime, focus?.center ?? new THREE.Vector3(0, 0, 0)),
     [sunTime, focus?.center]
   );
+  const ambientIntensity = modifiers.hasPrompt ? 0.33 : 0.35;
 
   function DynamicSun({
     sunTime,
@@ -1046,8 +932,8 @@ function SceneContent({
       <ViewportAutoCenter focus={focus} controlsRef={controlsRef} mapZoom={mapZoom} />
       <AutoRotateOnParcelLoad controlsRef={controlsRef} triggerToken={parcelToken} />
 
-      <ambientLight intensity={0.35} />
-      <SoftShadows size={40} samples={32} focus={0.9} />
+      <ambientLight intensity={ambientIntensity} />
+      <directionalLight position={[18, 22, 10]} intensity={0.35} />
       <DynamicSun sunTime={sunTime} focus={focus} intensity={sun.intensity} />
       <Environment preset="city" blur={0.75} />
 
@@ -1098,7 +984,7 @@ function SceneContent({
         <BuildingPreview
           maxHeight={data.maxHeight}
           footprintShape={footprintShape}
-          modifiers={modifiers}
+          buildingTypology={buildingTypology}
           buildingGroupRef={buildingGroupRef}
         />
       ) : null}
@@ -1111,6 +997,7 @@ function SceneContent({
 interface ParcelSceneProps {
   /** Données PLU pour le volume. Si null, la scène est vide (grille + lumières). */
   pluData: ParcelSceneData | null;
+  buildingTypology?: "massing" | "house" | "collective" | "mixed";
   className?: string;
   promptValue?: string;
   hidePromptInput?: boolean;
@@ -1126,6 +1013,7 @@ export const ParcelScene = forwardRef<ParcelSceneHandle, ParcelSceneProps>(
   function ParcelScene(
     {
       pluData,
+      buildingTypology = "collective",
       className,
       promptValue,
       hidePromptInput = false,
@@ -1171,8 +1059,9 @@ export const ParcelScene = forwardRef<ParcelSceneHandle, ParcelSceneProps>(
       ref,
       () => ({
         exportToObj: handleExportToObj,
+        buildingTypology,
       }),
-      [handleExportToObj]
+      [handleExportToObj, buildingTypology]
     );
 
     const handleCaptureReady = useCallback(
@@ -1263,6 +1152,7 @@ export const ParcelScene = forwardRef<ParcelSceneHandle, ParcelSceneProps>(
             <SceneContent
               data={sceneData}
               modifiers={modifiers}
+              buildingTypology={buildingTypology}
               sunTime={effectiveSunTime}
               mapZoom={mapZoom}
               onCaptureReady={handleCaptureReady}
@@ -1288,3 +1178,4 @@ export const ParcelScene = forwardRef<ParcelSceneHandle, ParcelSceneProps>(
     );
   }
 );
+

@@ -1,0 +1,133 @@
+"use client";
+
+import { useState } from "react";
+import { useRouter } from "next/navigation";
+import { Loader2 } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import {
+  Card,
+  CardHeader,
+  CardTitle,
+  CardContent,
+  CardDescription,
+} from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+
+export function NewAnalysisCard() {
+  const router = useRouter();
+  const [address, setAddress] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const handleSubmit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    const trimmed = address.trim();
+    if (trimmed.length < 5) {
+      setError("Adresse trop courte, merci de saisir une adresse complète.");
+      return;
+    }
+    setError(null);
+    setIsLoading(true);
+    try {
+      const res = await fetch("/api/feasibility", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ address: trimmed }),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data) {
+        const code = (data as { error?: string } | null)?.error;
+        const messages: Record<string, string> = {
+          INVALID_ADDRESS: "Adresse trop courte, merci de saisir une adresse complète.",
+          ADDRESS_NOT_FOUND: "Adresse introuvable, vérifiez l'adresse saisie.",
+          GEOCODE_FAILED: "Service de géocodage indisponible, réessayez.",
+          TIMEOUT:
+            "Services PLU momentanément indisponibles, réessayez dans quelques secondes.",
+          QUOTA_EXCEEDED: "QUOTA_EXCEEDED",
+        };
+        setError(
+          messages[code ?? ""] ??
+            ((data as { message?: string } | null)?.message ??
+              "Erreur inattendue, veuillez réessayer."),
+        );
+        setIsLoading(false);
+        return;
+      }
+      if (!("id" in data) || !data.id) {
+        setError("Réponse incomplète du serveur.");
+        setIsLoading(false);
+        return;
+      }
+      router.push(`/dashboard/study/${data.id as string}`);
+    } catch {
+      setError("Erreur inattendue, veuillez réessayer.");
+      setIsLoading(false);
+    }
+  };
+
+  return (
+    <Card className="border-border/70 bg-slate-950/70 text-slate-50 backdrop-blur-xl">
+      <CardHeader>
+        <CardTitle className="text-base font-semibold">Nouvelle analyse</CardTitle>
+        <CardDescription className="text-xs text-slate-400">
+          Saisissez une adresse pour lancer une étude PLU, marché et risques en un clic.
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        <form
+          onSubmit={handleSubmit}
+          className="flex flex-col gap-3 md:flex-row md:items-center"
+        >
+          <div className="flex-1 space-y-1">
+            <label
+              htmlFor="feasibility-address"
+              className="text-xs font-medium text-slate-300"
+            >
+              Adresse du terrain
+            </label>
+            <Input
+              id="feasibility-address"
+              value={address}
+              onChange={(e) => setAddress(e.target.value)}
+              placeholder="Ex : 10 Rue de la Paix, 75002 Paris"
+              className="h-10 bg-slate-900/70 text-sm text-slate-100 placeholder:text-slate-500"
+              disabled={isLoading}
+            />
+          </div>
+          <Button
+            type="submit"
+            disabled={isLoading}
+            className="mt-1 h-10 gap-2 bg-emerald-500 text-emerald-950 hover:bg-emerald-400 md:mt-6"
+          >
+            {isLoading ? (
+              <>
+                <Loader2 className="h-4 w-4 animate-spin" />
+                Lancement...
+              </>
+            ) : (
+              "Lancer l'analyse"
+            )}
+          </Button>
+        </form>
+        {error && (
+          <p className="mt-2 text-xs text-amber-300">
+            {error === "QUOTA_EXCEEDED" ? (
+              <>
+                Quota atteint.{" "}
+                <a
+                  href="/dashboard/billing"
+                  className="font-semibold text-emerald-400 underline-offset-2 hover:underline"
+                >
+                  Passer au plan Pro
+                </a>
+              </>
+            ) : (
+              error
+            )}
+          </p>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+

@@ -1,10 +1,81 @@
+import { neon } from "@neondatabase/serverless";
+import { getCache, setCache } from "./redis";
+
 /**
  * PLU Engine – extraction robuste des données d'urbanisme
  *
  * 1. Géocodage via l'API Adresse (api-adresse.data.gouv.fr)
- * 2. Zonage GPU via le WFS du Géoportail de l'Urbanisme (IGN)
+ * 2. Zonage GPU via PostGIS local (plu_zones) — fallback WFS si absent
  * 3. Parcelle cadastrale via l'API Cadastre (Etalab)
  */
+
+// ─── Client PostGIS (Neon HTTP, sans WebSocket) ────────────────────────────────
+
+let _neonSql: ReturnType<typeof neon> | null = null;
+
+function getNeonSql(): ReturnType<typeof neon> | null {
+  if (_neonSql) return _neonSql;
+  const url = (
+    process.env.DATABASE_URL ??
+    process.env.POSTGRES_URL ??
+    process.env.NEON_DATABASE_URL ??
+    ""
+  ).trim();
+  if (!url) return null;
+  _neonSql = neon(url);
+  return _neonSql;
+}
+
+/**
+ * Recherche la zone PLU dans la table PostGIS locale `plu_zones`.
+ * Ultra-rapide (~2–5 ms) grâce à l'index spatial GIST.
+ * Retourne null si la table est vide ou si la commune n'a pas été importée.
+ */
+async function getZoneUrbaFromPostGIS(lon: number, lat: number): Promise<ZoneUrba | null> {
+  const sql = getNeonSql();
+  if (!sql) return null;
+
+  try {
+    type PluZoneRow = {
+      libelle: string | null;
+      typezone: string | null;
+      code_commune: string | null;
+      nomfic: string | null;
+      urlfic: string | null;
+      datappro: string | null;
+    };
+
+    // neon() HTTP mode retourne un tableau de lignes plain objects
+    const rows = (await sql`
+      SELECT libelle, typezone, code_commune, nomfic, urlfic, datappro
+      FROM plu_zones
+      WHERE ST_Intersects(geom, ST_SetSRID(ST_MakePoint(${lon}, ${lat}), 4326))
+      LIMIT 1
+    `) as PluZoneRow[];
+
+    if (rows.length === 0) return null;
+
+    const row = rows[0];
+
+    return {
+      libelle: row.libelle ?? "N/A",
+      typezone: row.typezone ?? "N/A",
+      commune: row.code_commune ?? "N/A",
+      nomfic: row.nomfic ?? undefined,
+      urlfic: row.urlfic ?? undefined,
+      datappro: row.datappro ?? undefined,
+    };
+  } catch (err) {
+    // La table n'existe pas encore (avant le premier import) → on continue avec WFS
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes("plu_zones") || msg.includes("does not exist")) {
+      // Table absente : pas encore importée, fallback silencieux vers WFS
+    } else {
+      console.warn("[plu-engine][PostGIS] Erreur inattendue:", msg);
+    }
+    return null;
+  }
+}
 
 // ─── Types publics ────────────────────────────────────────────────────────────
 
@@ -66,6 +137,10 @@ export interface DvfSummary {
   medianValueEur: number | null;
   /** Valeur foncière moyenne (EUR), si calculable. */
   averageValueEur: number | null;
+  /** Prix de vente médian au m² bâti (EUR/m²), si calculable depuis DVF. */
+  medianPricePerM2Eur?: number | null;
+  /** Prix de vente moyen au m² bâti (EUR/m²), si calculable depuis DVF. */
+  averagePricePerM2Eur?: number | null;
   /** Date de mutation la plus récente (YYYY-MM-DD), si disponible. */
   latestMutationDate: string | null;
   /** Source de données utilisée. */
@@ -106,11 +181,11 @@ export interface PromoterBalance {
   surfacePlancherM2: number;
   /** Chiffre d'affaires potentiel (EUR). */
   chiffreAffairesEstimeEur: number;
-  /** Coût de construction (EUR), par défaut 1 800 €/m². */
+  /** Coût de construction (EUR), calculé avec un coût €/m² paramétrable. */
   coutConstructionEur: number;
   /** Frais annexes (EUR), 15% du CA. */
   fraisAnnexesEur: number;
-  /** Prix maximum recommandé pour le terrain (EUR) après marge cible de 15%. */
+  /** Prix maximum recommandé pour le terrain (EUR) après marge cible de 10%. */
   prixMaxTerrainEur: number;
 }
 
@@ -162,17 +237,9 @@ const DVF_MAX_RETRIES = 0;
 const GEORISQUES_TIMEOUT_MS = 7_000;
 const GEORISQUES_MAX_RETRIES = 2;
 const EARTH_RADIUS_M = 6_378_137;
-const DVF_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
-
-const dvfRowsCache = new Map<
-  string,
-  { expiresAt: number; rows: Array<Record<string, unknown>>; scope: "section" | "commune" }
->();
-
-const georisquesCache = new Map<
-  string,
-  { expiresAt: number; summary: GeorisquesSummary | null }
->();
+const DEFAULT_CONSTRUCTION_COST_EUR_PER_M2 = 1_300;
+const MIN_CONSTRUCTION_COST_EUR_PER_M2 = 600;
+const MAX_CONSTRUCTION_COST_EUR_PER_M2 = 4_500;
 
 // ─── Utilitaire interne ───────────────────────────────────────────────────────
 
@@ -226,7 +293,8 @@ function buildZoneWfsUrl(typeName: string, lon: number, lat: number): string {
     request: "GetFeature",
     typeName,
     outputFormat: "application/json",
-    CQL_FILTER: `INTERSECTS(the_geom,POINT(${lon} ${lat}))`,
+    // WFS 2.0 / EPSG:4326 axis order on this endpoint is lat lon (y x), not lon lat.
+    CQL_FILTER: `INTERSECTS(the_geom,POINT(${lat} ${lon}))`,
     maxFeatures: "1",
   });
 
@@ -246,6 +314,12 @@ function pickStringProperty(
   return undefined;
 }
 
+function buildGpuFileUrl(documentId: string, filename: string): string {
+  return `https://www.geoportail-urbanisme.gouv.fr/api/document/${encodeURIComponent(
+    documentId
+  )}/files/${encodeURIComponent(filename)}`;
+}
+
 function toFiniteNumber(value: unknown): number | null {
   const num =
     typeof value === "number"
@@ -254,6 +328,41 @@ function toFiniteNumber(value: unknown): number | null {
         ? Number.parseFloat(value.replace(",", "."))
         : Number.NaN;
   return Number.isFinite(num) ? num : null;
+}
+
+function pickFirstFiniteNumber(
+  row: Record<string, unknown>,
+  keys: string[]
+): number | null {
+  for (const key of keys) {
+    const value = toFiniteNumber(row[key]);
+    if (value !== null) return value;
+  }
+  return null;
+}
+
+function clampConstructionCost(value: number): number {
+  return Math.min(
+    MAX_CONSTRUCTION_COST_EUR_PER_M2,
+    Math.max(MIN_CONSTRUCTION_COST_EUR_PER_M2, value)
+  );
+}
+
+function resolveConstructionCostEurPerM2(override?: number | null): number {
+  const directValue =
+    typeof override === "number" && Number.isFinite(override) && override > 0
+      ? override
+      : null;
+  if (directValue !== null) {
+    return clampConstructionCost(directValue);
+  }
+
+  const envValue = toFiniteNumber(process.env.NEXT_PUBLIC_DEFAULT_CONSTRUCTION_COST_EUR_PER_M2);
+  if (typeof envValue === "number" && envValue > 0) {
+    return clampConstructionCost(envValue);
+  }
+
+  return DEFAULT_CONSTRUCTION_COST_EUR_PER_M2;
 }
 
 function median(values: number[]): number | null {
@@ -384,17 +493,23 @@ export function computeProfitabilityScore(params: {
   coveragePct?: number | null;
   maxHeightM?: number | null;
   medianDvfValueEur?: number | null;
+  medianSalePricePerM2Eur?: number | null;
+  constructionCostEurPerM2?: number | null;
 }): PromoterBalance | null {
   const parcelAreaM2 = params.parcelAreaM2 ?? null;
   const coveragePct = params.coveragePct ?? 50;
   const maxHeightM = params.maxHeightM ?? null;
   const medianDvfValueEur = params.medianDvfValueEur ?? null;
+  const medianSalePricePerM2Eur = params.medianSalePricePerM2Eur ?? null;
+  const constructionCostEurPerM2 = resolveConstructionCostEurPerM2(
+    params.constructionCostEurPerM2
+  );
 
   if (
     !parcelAreaM2 ||
     parcelAreaM2 <= 0 ||
-    !medianDvfValueEur ||
-    medianDvfValueEur <= 0
+    ((!medianDvfValueEur || medianDvfValueEur <= 0) &&
+      (!medianSalePricePerM2Eur || medianSalePricePerM2Eur <= 0))
   ) {
     return null;
   }
@@ -407,13 +522,15 @@ export function computeProfitabilityScore(params: {
   const footprintM2 = parcelAreaM2 * (clampedCoveragePct / 100);
   const surfacePlancherM2 = footprintM2 * theoreticalLevels;
 
-  // Hypothèse: la valeur DVF médiane donnée correspond à la valeur d'une mutation
-  // rapportée à la surface du terrain; on ramène cela à un prix €/m² de plancher.
-  const localPricePerM2 = medianDvfValueEur / parcelAreaM2;
+  // Prix de vente local: on privilégie le vrai prix au m² bâti issu de DVF.
+  // Fallback historique si indisponible: valeur médiane DVF / surface de parcelle.
+  const localPricePerM2 =
+    medianSalePricePerM2Eur && medianSalePricePerM2Eur > 0
+      ? medianSalePricePerM2Eur
+      : (medianDvfValueEur as number) / parcelAreaM2;
   const chiffreAffairesEstimeEur = surfacePlancherM2 * localPricePerM2;
 
-  const coutConstructionM2 = 1_800;
-  const coutConstructionEur = surfacePlancherM2 * coutConstructionM2;
+  const coutConstructionEur = surfacePlancherM2 * constructionCostEurPerM2;
   const fraisAnnexesEur = chiffreAffairesEstimeEur * 0.15;
   const margeCibleEur = chiffreAffairesEstimeEur * 0.1;
 
@@ -582,6 +699,16 @@ export async function getZoneUrba(
     );
   }
 
+  // ── Tentative PostGIS locale (si plu_zones est importée) ──────────────────
+  const postgisResult = await getZoneUrbaFromPostGIS(lon, lat);
+  if (postgisResult) {
+    console.log(`[plu-engine][PostGIS] Zone trouvée pour (${lon}, ${lat}): ${postgisResult.typezone} ${postgisResult.libelle}`);
+    return postgisResult;
+  }
+
+  // ── Fallback : WFS GPU en live (IGN) ──────────────────────────────────────
+  console.log(`[plu-engine][WFS] PostGIS vide pour (${lon}, ${lat}), fallback WFS…`);
+
   let lastError: unknown = null;
   let lastFailedWfsUrl: string | null = null;
 
@@ -611,6 +738,14 @@ export async function getZoneUrba(
         }
 
         const properties = (data.features[0]?.properties ?? {}) as Record<string, unknown>;
+        const nomfic = pickStringProperty(properties, ["nomfic", "NOMFIC"]);
+        const urlfic =
+          pickStringProperty(properties, ["urlfic", "URLFIC"]) ??
+          (() => {
+            const gpuDocId = pickStringProperty(properties, ["gpu_doc_id", "GPU_DOC_ID"]);
+            if (!gpuDocId || !nomfic) return undefined;
+            return buildGpuFileUrl(gpuDocId, nomfic);
+          })();
 
         // Géoplateforme / WFS + variantes CNIG (casse / alias).
         return {
@@ -639,8 +774,8 @@ export async function getZoneUrba(
               "insee",
               "INSEE",
             ]) ?? "N/A",
-          nomfic: pickStringProperty(properties, ["nomfic", "NOMFIC"]),
-          urlfic: pickStringProperty(properties, ["urlfic", "URLFIC"]),
+          nomfic,
+          urlfic,
           datappro: pickStringProperty(properties, ["datappro", "DATAPPRO"]),
         };
       } catch (error) {
@@ -772,226 +907,314 @@ export async function getDvfSummaryNearby(
   lon: number,
   lat: number
 ): Promise<DvfSummary | null> {
-  if (!isFinite(lon) || !isFinite(lat)) {
-    throw new PLUEngineError(
-      `Coordonnées invalides : lon=${lon}, lat=${lat}`,
-      "INVALID_COORDS"
-    );
-  }
-
-  const geom = encodeURIComponent(
-    JSON.stringify({ type: "Point", coordinates: [lon, lat] })
-  );
-  const cadastreUrl = `${CADASTRE_API_URL}?geom=${geom}`;
-  let cadastreJson: { features?: Array<{ properties?: Record<string, unknown> }> };
   try {
-    cadastreJson = (await fetchJsonWithRetry(
-      cadastreUrl,
-      FETCH_TIMEOUT_MS,
-      DVF_MAX_RETRIES
-    )) as { features?: Array<{ properties?: Record<string, unknown> }> };
-  } catch (err) {
-    console.warn(
-      `[plu-engine] Timeout esquivé sur ${cadastreUrl}, passage au fallback.`
+    if (!isFinite(lon) || !isFinite(lat)) {
+      throw new PLUEngineError(
+        `Coordonnées invalides : lon=${lon}, lat=${lat}`,
+        "INVALID_COORDS"
+      );
+    }
+
+    const geom = encodeURIComponent(
+      JSON.stringify({ type: "Point", coordinates: [lon, lat] })
     );
-    return null;
-  }
-
-  const properties = cadastreJson?.features?.[0]?.properties;
-  if (!properties || typeof properties !== "object") return null;
-
-  const inseeCode = pickStringProperty(properties, ["code_insee", "insee", "INSEE"]);
-  const idu = pickStringProperty(properties, ["idu", "IDU"]);
-  const sectionCode = idu && idu.length >= 10 ? idu.slice(5, 10) : null;
-
-  if (!inseeCode || !sectionCode) return null;
-
-  function parseDvfRows(payload: unknown): Array<Record<string, unknown>> {
-    if (Array.isArray(payload)) {
-      return payload.filter((row): row is Record<string, unknown> => !!row && typeof row === "object");
-    }
-    if (!payload || typeof payload !== "object") return [];
-    const asObject = payload as Record<string, unknown>;
-    if (Array.isArray(asObject.mutations)) {
-      return asObject.mutations.filter(
-        (row): row is Record<string, unknown> => !!row && typeof row === "object"
-      );
-    }
-    if (Array.isArray(asObject.results)) {
-      return asObject.results.filter(
-        (row): row is Record<string, unknown> => !!row && typeof row === "object"
-      );
-    }
-    return [];
-  }
-
-  function isServerError(error: unknown): boolean {
-    if (!(error instanceof Error)) return false;
-    return /HTTP\s5\d{2}/.test(error.message);
-  }
-
-  async function fetchDvfFor(
-    scope: "section" | "commune"
-  ): Promise<{ rows: Array<Record<string, unknown>>; scope: "section" | "commune" }> {
-    const cacheKey =
-      scope === "section"
-        ? `section:${inseeCode}:${sectionCode}`
-        : `commune:${inseeCode}`;
-    const cached = dvfRowsCache.get(cacheKey);
-    const now = Date.now();
-    if (cached && cached.expiresAt > now) {
-      return { rows: cached.rows, scope: cached.scope };
-    }
-
-    const cquestUrl =
-      scope === "section"
-        ? `${DVF_API_BASE_URL}?section=${encodeURIComponent(
-            `${inseeCode}000${sectionCode}`
-          )}`
-        : `${DVF_API_BASE_URL}?code_commune=${encodeURIComponent(inseeCode)}`;
-
-    const etalabUrl =
-      scope === "section"
-        ? `${DVF_API_FALLBACK_URL}/${encodeURIComponent(inseeCode)}/${encodeURIComponent(
-            sectionCode
-          )}`
-        : `${DVF_API_FALLBACK_URL}/${encodeURIComponent(inseeCode)}`;
-
-    console.log(`[plu-engine][getDvfSummaryNearby] DVF URL (${scope}): ${cquestUrl}`);
-
-    let rows: Array<Record<string, unknown>> = [];
-
+    const cadastreUrl = `${CADASTRE_API_URL}?geom=${geom}`;
+    let cadastreJson: { features?: Array<{ properties?: Record<string, unknown> }> };
     try {
-      const cquestJson = await fetchJsonWithRetry(cquestUrl, DVF_TIMEOUT_MS, DVF_MAX_RETRIES);
-      rows = parseDvfRows(cquestJson);
-      if (rows.length > 0) {
-        dvfRowsCache.set(cacheKey, {
-          rows,
-          scope,
-          expiresAt: now + DVF_CACHE_TTL_MS,
-        });
-        return { rows, scope };
-      }
-    } catch (error) {
-      const isTimeout = error instanceof PLUEngineError && error.code === "TIMEOUT";
-      if (isTimeout) {
-        console.warn(`[plu-engine] Timeout esquivé sur ${cquestUrl}, passage au fallback.`);
-      } else if (!isServerError(error)) {
-        throw error;
-      } else {
-        console.warn(
-          `[getDvfSummaryNearby] DVF ${scope} CQuest indisponible, fallback Etalab`,
-          error
+      cadastreJson = (await fetchJsonWithRetry(
+        cadastreUrl,
+        FETCH_TIMEOUT_MS,
+        DVF_MAX_RETRIES
+      )) as { features?: Array<{ properties?: Record<string, unknown> }> };
+    } catch (err) {
+      console.warn(
+        `[plu-engine] Timeout esquivé sur ${cadastreUrl}, passage au fallback.`,
+        err
+      );
+      return {
+        inseeCode: "",
+        sectionCode: "",
+        mutationCount: 0,
+        medianValueEur: null,
+        averageValueEur: null,
+        latestMutationDate: null,
+        source: "dvf-etalab",
+        scope: "commune",
+        dvfHistory: [],
+      };
+    }
+
+    const properties = cadastreJson?.features?.[0]?.properties;
+    if (!properties || typeof properties !== "object") {
+      return {
+        inseeCode: "",
+        sectionCode: "",
+        mutationCount: 0,
+        medianValueEur: null,
+        averageValueEur: null,
+        latestMutationDate: null,
+        source: "dvf-etalab",
+        scope: "commune",
+        dvfHistory: [],
+      };
+    }
+
+    const inseeCode = pickStringProperty(properties, ["code_insee", "insee", "INSEE"]);
+    const idu = pickStringProperty(properties, ["idu", "IDU"]);
+    const sectionCode = idu && idu.length >= 10 ? idu.slice(5, 10) : null;
+
+    if (!inseeCode || !sectionCode) {
+      return {
+        inseeCode: "",
+        sectionCode: "",
+        mutationCount: 0,
+        medianValueEur: null,
+        averageValueEur: null,
+        latestMutationDate: null,
+        source: "dvf-etalab",
+        scope: "commune",
+        dvfHistory: [],
+      };
+    }
+
+    function parseDvfRows(payload: unknown): Array<Record<string, unknown>> {
+      if (Array.isArray(payload)) {
+        return payload.filter(
+          (row): row is Record<string, unknown> => !!row && typeof row === "object"
         );
       }
-    }
-
-    try {
-      console.log(`[plu-engine][getDvfSummaryNearby] DVF fallback URL (${scope}): ${etalabUrl}`);
-      const etalabJson = await fetchJsonWithRetry(
-        etalabUrl,
-        DVF_TIMEOUT_MS,
-        DVF_MAX_RETRIES
-      );
-      rows = parseDvfRows(etalabJson);
-    } catch (error) {
-      if (error instanceof PLUEngineError && error.code === "TIMEOUT") {
-        console.warn(`[plu-engine] Timeout esquivé sur ${etalabUrl}, passage au fallback.`);
-      } else {
-        console.warn(`[getDvfSummaryNearby] DVF ${scope} fallback Etalab failed`, error);
+      if (!payload || typeof payload !== "object") return [];
+      const asObject = payload as Record<string, unknown>;
+      if (Array.isArray(asObject.mutations)) {
+        return asObject.mutations.filter(
+          (row): row is Record<string, unknown> => !!row && typeof row === "object"
+        );
       }
-      rows = [];
+      if (Array.isArray(asObject.results)) {
+        return asObject.results.filter(
+          (row): row is Record<string, unknown> => !!row && typeof row === "object"
+        );
+      }
+      return [];
     }
 
-    dvfRowsCache.set(cacheKey, {
-      rows,
-      scope,
-      expiresAt: now + DVF_CACHE_TTL_MS,
-    });
-    return { rows, scope };
-  }
+    function isServerError(error: unknown): boolean {
+      if (!(error instanceof Error)) return false;
+      return /HTTP\s5\d{2}/.test(error.message);
+    }
 
-  let dvfRows: Array<Record<string, unknown>> = [];
-  let scope: "section" | "commune" = "section";
+    async function fetchDvfFor(
+      scope: "section" | "commune"
+    ): Promise<{ rows: Array<Record<string, unknown>>; scope: "section" | "commune" }> {
+      const cacheKey =
+        scope === "section"
+          ? `dvf:section:${inseeCode}:${sectionCode}`
+          : `dvf:commune:${inseeCode}`;
 
-  try {
-    const result = await fetchDvfFor("section");
-    dvfRows = result.rows;
-    scope = result.scope;
-  } catch (error) {
-    console.warn("[getDvfSummaryNearby] DVF section fetch failed, trying commune", error);
-  }
+      const cached = await getCache<{
+        rows: Array<Record<string, unknown>>;
+        scope: "section" | "commune";
+      }>(cacheKey);
+      if (cached) {
+        return { rows: cached.rows, scope: cached.scope };
+      }
 
-  if (dvfRows.length === 0) {
+      const cquestUrl =
+        scope === "section"
+          ? `${DVF_API_BASE_URL}?section=${encodeURIComponent(
+              `${inseeCode}000${sectionCode}`
+            )}`
+          : `${DVF_API_BASE_URL}?code_commune=${encodeURIComponent(inseeCode)}`;
+
+      // Fallback Etalab uniquement pour le scope "section"
+      const etalabUrl =
+        scope === "section"
+          ? `${DVF_API_FALLBACK_URL}/${encodeURIComponent(
+              inseeCode
+            )}/${encodeURIComponent(sectionCode)}`
+          : null;
+
+      console.log(`[plu-engine][getDvfSummaryNearby] DVF URL (${scope}): ${cquestUrl}`);
+
+      let rows: Array<Record<string, unknown>> = [];
+
+      try {
+        const cquestJson = await fetchJsonWithRetry(cquestUrl, DVF_TIMEOUT_MS, DVF_MAX_RETRIES);
+        rows = parseDvfRows(cquestJson);
+        if (rows.length > 0) {
+          await setCache(cacheKey, { rows, scope }, 86_400);
+          return { rows, scope };
+        }
+      } catch (error) {
+        const isTimeout = error instanceof PLUEngineError && error.code === "TIMEOUT";
+        if (isTimeout) {
+          console.warn(`[plu-engine] Timeout esquivé sur ${cquestUrl}, passage au fallback.`);
+        } else if (!isServerError(error)) {
+          throw error;
+        } else {
+          console.warn(
+            `[getDvfSummaryNearby] DVF ${scope} CQuest indisponible, fallback Etalab ou neutre`,
+            error
+          );
+        }
+      }
+
+      // Si on est sur la commune, on ne tente pas Etalab (URL invalide), on retourne directement neutre.
+      if (scope === "commune") {
+        await setCache(cacheKey, { rows: [], scope }, 86_400);
+        return { rows: [], scope };
+      }
+
+      if (etalabUrl) {
+        try {
+          console.log(
+            `[plu-engine][getDvfSummaryNearby] DVF fallback URL (${scope}): ${etalabUrl}`
+          );
+          const etalabJson = await fetchJsonWithRetry(
+            etalabUrl,
+            DVF_TIMEOUT_MS,
+            DVF_MAX_RETRIES
+          );
+          rows = parseDvfRows(etalabJson);
+        } catch (error) {
+          if (error instanceof PLUEngineError && error.code === "TIMEOUT") {
+            console.warn(`[plu-engine] Timeout esquivé sur ${etalabUrl}, passage au fallback.`);
+          } else {
+            console.warn(`[getDvfSummaryNearby] DVF ${scope} fallback Etalab failed`, error);
+          }
+          rows = [];
+        }
+      }
+
+      await setCache(cacheKey, { rows, scope }, 86_400);
+      return { rows, scope };
+    }
+
+    let dvfRows: Array<Record<string, unknown>> = [];
+    let scope: "section" | "commune" = "section";
+
     try {
-      const result = await fetchDvfFor("commune");
+      const result = await fetchDvfFor("section");
       dvfRows = result.rows;
       scope = result.scope;
     } catch (error) {
-      console.warn("[getDvfSummaryNearby] DVF commune fetch failed", error);
+      console.warn("[getDvfSummaryNearby] DVF section fetch failed, trying commune", error);
     }
-  }
 
-  if (dvfRows.length === 0) {
+    if (dvfRows.length === 0) {
+      try {
+        const result = await fetchDvfFor("commune");
+        dvfRows = result.rows;
+        scope = result.scope;
+      } catch (error) {
+        console.warn("[getDvfSummaryNearby] DVF commune fetch failed", error);
+      }
+    }
+
+    if (dvfRows.length === 0) {
+      return {
+        inseeCode,
+        sectionCode,
+        mutationCount: 0,
+        medianValueEur: null,
+        averageValueEur: null,
+        medianPricePerM2Eur: null,
+        averagePricePerM2Eur: null,
+        latestMutationDate: null,
+        source: "dvf-etalab",
+        scope,
+        dvfHistory: [],
+      };
+    }
+
+    const values: number[] = [];
+    const pricePerM2Values: number[] = [];
+    let latestMutationDate: string | null = null;
+    const yearlyValues: Record<string, number[]> = {};
+
+    for (const row of dvfRows) {
+      const value = toFiniteNumber(row.valeur_fonciere);
+      if (value !== null) values.push(value);
+
+      const builtSurfaceM2 = pickFirstFiniteNumber(row, [
+        "surface_reelle_bati",
+        "surface_bati",
+        "surface_habitable",
+        "sbati",
+      ]);
+
+      if (value !== null && builtSurfaceM2 !== null && builtSurfaceM2 > 8) {
+        const unitPrice = value / builtSurfaceM2;
+        // Filtre anti-outliers grossiers (prix/m² transactionnel).
+        if (Number.isFinite(unitPrice) && unitPrice >= 300 && unitPrice <= 20_000) {
+          pricePerM2Values.push(unitPrice);
+        }
+      }
+
+      const date = pickStringProperty(row, ["date_mutation"]);
+      if (date && (!latestMutationDate || date > latestMutationDate)) {
+        latestMutationDate = date;
+      }
+
+      if (date && value !== null) {
+        const yearMatch = date.match(/^(\d{4})/);
+        const year = yearMatch ? yearMatch[1] : null;
+        if (year) {
+          if (!yearlyValues[year]) yearlyValues[year] = [];
+          yearlyValues[year].push(value);
+        }
+      }
+    }
+
+    const avg =
+      values.length > 0 ? values.reduce((sum, value) => sum + value, 0) / values.length : null;
+    const avgPricePerM2 =
+      pricePerM2Values.length > 0
+        ? pricePerM2Values.reduce((sum, value) => sum + value, 0) / pricePerM2Values.length
+        : null;
+
+    const dvfHistory =
+      Object.keys(yearlyValues).length > 0
+        ? Object.keys(yearlyValues)
+            .sort()
+            .map((year) => ({
+              year,
+              price: median(yearlyValues[year]) ?? 0,
+            }))
+        : [];
+
     return {
       inseeCode,
       sectionCode,
+      mutationCount: dvfRows.length,
+      medianValueEur: median(values),
+      averageValueEur: avg,
+      medianPricePerM2Eur: median(pricePerM2Values),
+      averagePricePerM2Eur: avgPricePerM2,
+      latestMutationDate,
+      source: "dvf-etalab",
+      scope,
+      dvfHistory,
+    };
+  } catch (error) {
+    console.warn(
+      "[getDvfSummaryNearby] unexpected error, returning empty DVF summary",
+      error
+    );
+    return {
+      inseeCode: "",
+      sectionCode: "",
       mutationCount: 0,
       medianValueEur: null,
       averageValueEur: null,
+      medianPricePerM2Eur: null,
+      averagePricePerM2Eur: null,
       latestMutationDate: null,
       source: "dvf-etalab",
-      scope,
+      scope: "commune",
+      dvfHistory: [],
     };
   }
-
-  const values: number[] = [];
-  let latestMutationDate: string | null = null;
-  const yearlyValues: Record<string, number[]> = {};
-
-  for (const row of dvfRows) {
-    const value = toFiniteNumber(row.valeur_fonciere);
-    if (value !== null) values.push(value);
-
-    const date = pickStringProperty(row, ["date_mutation"]);
-    if (date && (!latestMutationDate || date > latestMutationDate)) {
-      latestMutationDate = date;
-    }
-
-    if (date && value !== null) {
-      const yearMatch = date.match(/^(\d{4})/);
-      const year = yearMatch ? yearMatch[1] : null;
-      if (year) {
-        if (!yearlyValues[year]) yearlyValues[year] = [];
-        yearlyValues[year].push(value);
-      }
-    }
-  }
-
-  const avg =
-    values.length > 0 ? values.reduce((sum, value) => sum + value, 0) / values.length : null;
-
-  const dvfHistory =
-    Object.keys(yearlyValues).length > 0
-      ? Object.keys(yearlyValues)
-          .sort()
-          .map((year) => ({
-            year,
-            price: median(yearlyValues[year]) ?? 0,
-          }))
-      : [];
-
-  return {
-    inseeCode,
-    sectionCode,
-    mutationCount: dvfRows.length,
-    medianValueEur: median(values),
-    averageValueEur: avg,
-    latestMutationDate,
-    source: "dvf-etalab",
-    scope,
-    dvfHistory,
-  };
 }
 
 /**
@@ -1005,17 +1228,20 @@ export async function getGeorisquesNearby(
   lat: number
 ): Promise<GeorisquesSummary | null> {
   try {
-    const cacheKey = `${lon.toFixed(5)},${lat.toFixed(5)}`;
-    const cached = georisquesCache.get(cacheKey);
-    const now = Date.now();
-    if (cached && cached.expiresAt > now) {
-      return cached.summary;
-    }
     if (!isFinite(lon) || !isFinite(lat)) {
       throw new PLUEngineError(
         `Coordonnées invalides : lon=${lon}, lat=${lat}`,
         "INVALID_COORDS"
       );
+    }
+
+    const roundedLon = Number(lon.toFixed(4));
+    const roundedLat = Number(lat.toFixed(4));
+    const cacheKey = `georisques:${roundedLon}:${roundedLat}`;
+
+    const cached = await getCache<GeorisquesSummary | null>(cacheKey);
+    if (cached) {
+      return cached;
     }
 
     // On récupère d'abord le code INSEE via le cadastre pour alimenter l'endpoint GASPAR.
@@ -1138,28 +1364,21 @@ export async function getGeorisquesNearby(
     if (successfulCalls === 0) {
       if (lastError) {
         console.warn(
-          "[plu-engine][getGeorisquesNearby] all Georisques calls failed, using statistical fallback",
+          "[plu-engine][getGeorisquesNearby] all Georisques calls failed, using neutral fallback",
           lastError
         );
       }
 
       const summary: GeorisquesSummary = {
-        floodRisk: true,
-        floodLevel: "MEDIUM",
-        clayRisk: true,
-        clayLevel: "MEDIUM",
+        floodRisk: false,
+        floodLevel: "UNKNOWN",
+        clayRisk: false,
+        clayLevel: "UNKNOWN",
         hazardCount: 0,
         source: "georisques",
         isFallback: true,
-        inondationMeta: { niveau: "Moyen", source: "Données statistiques" },
-        argileMeta: { niveau: "Moyen", source: "Données statistiques" },
-        inondation: { niveau: "Moyen", source: "Données statistiques" },
-        argile: { niveau: "Moyen", source: "Données statistiques" },
       };
-      georisquesCache.set(cacheKey, {
-        summary,
-        expiresAt: now + DVF_CACHE_TTL_MS,
-      });
+      await setCache(cacheKey, summary, 3_600);
       return summary;
     }
 
@@ -1192,38 +1411,34 @@ export async function getGeorisquesNearby(
         source: "Géorisques RGA",
       },
     };
-    georisquesCache.set(cacheKey, {
-      summary,
-      expiresAt: Date.now() + DVF_CACHE_TTL_MS,
-    });
+    await setCache(cacheKey, summary, 3_600);
     return summary;
   } catch (error) {
     if (error instanceof PLUEngineError && error.code === "TIMEOUT") {
-      console.warn(`[plu-engine] Timeout esquivé sur cadastre/georisques, passage au fallback.`);
+      console.warn(
+        `[plu-engine] Timeout esquivé sur cadastre/georisques, retour d'un résumé neutre.`,
+        error
+      );
     } else {
       console.warn(
-        "[plu-engine][getGeorisquesNearby] unexpected error, returning statistical fallback",
+        "[plu-engine][getGeorisquesNearby] unexpected error, returning neutral fallback",
         error
       );
     }
-    const summary: GeorisquesSummary = {
-      floodRisk: true,
-      floodLevel: "MEDIUM",
-      clayRisk: true,
-      clayLevel: "MEDIUM",
+    const fallback: GeorisquesSummary = {
+      floodRisk: false,
+      floodLevel: "UNKNOWN",
+      clayRisk: false,
+      clayLevel: "UNKNOWN",
       hazardCount: 0,
       source: "georisques",
       isFallback: true,
-      inondationMeta: { niveau: "Moyen", source: "Données statistiques" },
-      argileMeta: { niveau: "Moyen", source: "Données statistiques" },
-      inondation: { niveau: "Moyen", source: "Données statistiques" },
-      argile: { niveau: "Moyen", source: "Données statistiques" },
     };
-    georisquesCache.set(`${lon.toFixed(5)},${lat.toFixed(5)}`, {
-      summary,
-      expiresAt: Date.now() + DVF_CACHE_TTL_MS,
-    });
-    return summary;
+    const roundedLon = Number(lon.toFixed(4));
+    const roundedLat = Number(lat.toFixed(4));
+    const cacheKey = `georisques:${roundedLon}:${roundedLat}`;
+    await setCache(cacheKey, fallback, 3_600);
+    return fallback;
   }
 }
 

@@ -1,6 +1,7 @@
 import { betterAuth } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { stripe } from "@better-auth/stripe";
+import { dash } from "@better-auth/infra";
 import Stripe from "stripe";
 import { eq } from "drizzle-orm";
 import { DB_AVAILABLE, db } from "@/src/db";
@@ -74,6 +75,11 @@ const guestAuth = {
 
 export const auth = db
   ? betterAuth({
+      baseURL: process.env.BETTER_AUTH_URL ?? "http://localhost:3000",
+      trustedOrigins: [
+        process.env.BETTER_AUTH_URL ?? "http://localhost:3000",
+        "http://127.0.0.1:3000",
+      ],
       database: drizzleAdapter(db, {
         provider: "pg",
         schema: {
@@ -84,6 +90,9 @@ export const auth = db
           subscription: schema.subscription,
         },
       }),
-      plugins: stripePlugins,
+      emailAndPassword: {
+        enabled: true,
+      },
+      plugins: [...stripePlugins, dash()],
     })
   : (guestAuth as unknown as ReturnType<typeof betterAuth>);

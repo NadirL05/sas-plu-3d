@@ -1,21 +1,45 @@
 import { headers } from "next/headers";
+import { redirect } from "next/navigation";
+import { desc, eq } from "drizzle-orm";
 import { auth } from "@/src/lib/auth";
-import { PLUDashboard } from "@/components/dashboard/plu-dashboard";
+import { db } from "@/src/db";
+import { feasibilityStudy } from "@/src/db/schema";
+import { NewAnalysisCard } from "./_components/new-analysis-card";
+import { RecentStudiesList } from "./_components/recent-studies-list";
 
-export const metadata = {
-  title: "Analyse PLU – SAS PLU 3D",
-  description:
-    "Recherchez une adresse et consultez les informations de zonage du Plan Local d'Urbanisme.",
-};
+export const metadata = { title: "Dashboard – SAS PLU 3D" };
 
 export default async function DashboardPage() {
   let session: Awaited<ReturnType<typeof auth.api.getSession>> | null = null;
   try {
     session = await auth.api.getSession({ headers: await headers() });
-  } catch (error) {
-    console.warn("[dashboard.page] session fallback invite", error);
+  } catch {
+    // ignore, handled below
   }
-  const isAuthenticated = !!session?.user;
 
-  return <PLUDashboard isAuthenticated={isAuthenticated} />;
+  const userId = session?.user?.id;
+  if (!userId) {
+    redirect("/sign-in?redirectTo=/dashboard");
+  }
+
+  const studies = await db
+    .select({
+      id: feasibilityStudy.id,
+      address: feasibilityStudy.address,
+      createdAt: feasibilityStudy.createdAt,
+      zoning: feasibilityStudy.zoning,
+      promoterBalance: feasibilityStudy.promoterBalance,
+      status: feasibilityStudy.status,
+    })
+    .from(feasibilityStudy)
+    .where(eq(feasibilityStudy.userId, userId))
+    .orderBy(desc(feasibilityStudy.createdAt))
+    .limit(20);
+
+  return (
+    <div className="mx-auto flex max-w-5xl flex-col gap-5 px-4 py-6 md:py-8">
+      <NewAnalysisCard />
+      <RecentStudiesList studies={studies} />
+    </div>
+  );
 }

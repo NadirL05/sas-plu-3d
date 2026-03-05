@@ -1,39 +1,40 @@
 import { NextResponse } from "next/server";
+import OpenAI from "openai";
 
-type AnalyzePluPdfBody = {
-  urlfic?: string;
-};
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-export async function POST(request: Request) {
+export async function POST(req: Request) {
   try {
-    const body = (await request.json().catch(() => null)) as AnalyzePluPdfBody | null;
-    const urlfic = body?.urlfic;
+    const { urlfic } = await req.json();
 
-    if (!urlfic || typeof urlfic !== "string") {
-      return NextResponse.json(
-        { error: "Paramètre 'urlfic' requis." },
-        { status: 400 }
-      );
+    if (!urlfic) {
+      return NextResponse.json({ error: "Aucun lien PDF fourni." }, { status: 400 });
     }
 
-    // Simulation d'un temps de traitement IA (~3 secondes)
-    await sleep(3000);
+    const response = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content: `Tu es un expert en urbanisme réglementaire français. L'utilisateur te fournit un lien vers un règlement PLU : ${urlfic}. Ton objectif est d'extraire les règles de constructibilité de la zone concernée. Tu dois OBLIGATOIREMENT répondre avec un objet JSON strict contenant ces 3 clés : - "ces" (Coefficient d'Emprise au Sol, ex: "40%" ou "Non réglementé") - "retrait" (Règles d'implantation par rapport aux limites, ex: "4 mètres" ou "L=H/2") - "espacesVerts" (Obligation de pleine terre, ex: "30% de la parcelle")`,
+        },
+        {
+          role: "user",
+          content: "Analyse ce document réglementaire et donne-moi les 3 règles principales.",
+        },
+      ],
+    });
+
+    const extractedData = JSON.parse(response.choices[0].message.content || "{}");
 
     return NextResponse.json({
-      ces: "40%",
-      retrait: "4m",
-      espacesVerts: "30%",
+      ces: extractedData.ces || "Non spécifié",
+      retrait: extractedData.retrait || "Non spécifié",
+      espacesVerts: extractedData.espacesVerts || "Non spécifié",
     });
   } catch (error) {
-    console.error("[plu/analyze-pdf] error", error);
-    return NextResponse.json(
-      { error: "Analyse du PDF impossible pour le moment." },
-      { status: 500 }
-    );
+    console.error("[API PLU Analyze] Erreur OpenAI:", error);
+    return NextResponse.json({ error: "L'analyse IA a échoué." }, { status: 500 });
   }
 }
-

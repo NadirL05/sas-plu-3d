@@ -285,10 +285,19 @@ export function PLUDashboard({ isAuthenticated = false }: PLUDashboardProps) {
   const [isLoadingRisks, setIsLoadingRisks] = useState(false);
   const [georisquesSummary, setGeorisquesSummary] = useState<GeorisquesSummary | null>(null);
   const [scenePrompt, setScenePrompt] = useState("");
+  const [isAiAnalyzing, setIsAiAnalyzing] = useState(false);
+  const [aiArchitectParams, setAiArchitectParams] = useState<{
+    recommendedHeight?: number;
+    roofType?: "flat" | "sloped";
+    hasCommercialGround?: boolean;
+  } | null>(null);
   const [captureScene, setCaptureScene] = useState<(() => string | null) | null>(null);
   const [mapCenter, setMapCenter] = useState(DEFAULT_MAP_CENTER);
   const [mapZoom, setMapZoom] = useState(14);
   const [sunTime, setSunTime] = useState(14);
+  const [buildingTypology, setBuildingTypology] = useState<
+    "massing" | "house" | "collective" | "mixed"
+  >("collective");
   const [isMapReady, setIsMapReady] = useState(false);
   const [mapError, setMapError] = useState<string | null>(null);
   const [mapVisualMode, setMapVisualMode] =
@@ -702,6 +711,38 @@ export function PLUDashboard({ isAuthenticated = false }: PLUDashboardProps) {
     }
   }, [zone?.urlfic]);
 
+  const handleAnalyzePrompt = useCallback(async () => {
+    if (!scenePrompt.trim() || !selectedAddress) return;
+    setIsAiAnalyzing(true);
+    try {
+      const currentMaxHeight =
+        zone?.typezone === MOCK_ZONE_DATA.zone.typezone
+          ? MOCK_ZONE_DATA.maxHeight
+          : zone?.typezone
+          ? DEFAULT_MAX_HEIGHT_BY_ZONE[zone.typezone] ?? 9
+          : 9;
+
+      const res = await fetch("/api/ai/analyze-zoning", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt: scenePrompt,
+          currentMaxHeight,
+          parcelArea: parcel?.areaM2,
+        }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setAiArchitectParams(data);
+      if (data.aiFeedback) toast.success(data.aiFeedback);
+    } catch (error) {
+      console.error("[handleAnalyzePrompt]", error);
+      toast.error("L'analyse IA a échoué. Vérifiez votre clé OPENAI_API_KEY.");
+    } finally {
+      setIsAiAnalyzing(false);
+    }
+  }, [scenePrompt, selectedAddress, zone?.typezone, parcel?.areaM2]);
+
   const handleCopyPublicLink = useCallback(() => {
     if (!currentProjectId) {
       toast.error("Enregistrez d'abord le projet pour générer un lien public.");
@@ -820,7 +861,15 @@ export function PLUDashboard({ isAuthenticated = false }: PLUDashboardProps) {
     }
   }, [captureScene, parcel, scenePrompt, selectedAddress, uploadSceneCapture, zone]);
 
-  const parcelSceneData = buildParcelSceneData(zone, parcel, selectedAddress);
+  const baseParcelSceneData = buildParcelSceneData(zone, parcel, selectedAddress);
+  const parcelSceneData = baseParcelSceneData
+    ? {
+        ...baseParcelSceneData,
+        maxHeight: aiArchitectParams?.recommendedHeight ?? baseParcelSceneData.maxHeight,
+        roofType: aiArchitectParams?.roofType,
+        hasCommercialGround: aiArchitectParams?.hasCommercialGround,
+      }
+    : null;
   const maxHeight = zone
     ? zone.typezone === MOCK_ZONE_DATA.zone.typezone
       ? MOCK_ZONE_DATA.maxHeight
@@ -848,6 +897,7 @@ export function PLUDashboard({ isAuthenticated = false }: PLUDashboardProps) {
     coveragePct: groundCoveragePct,
     maxHeightM: maxHeight,
     medianDvfValueEur: dvfSummary?.medianValueEur ?? null,
+    medianSalePricePerM2Eur: dvfSummary?.medianPricePerM2Eur ?? null,
   });
   const promoterBalance = profitability;
   const floodRiskVisual = getRiskVisual(georisquesSummary?.floodLevel ?? "UNKNOWN");
@@ -1061,10 +1111,15 @@ export function PLUDashboard({ isAuthenticated = false }: PLUDashboardProps) {
                 <Button
                   type="button"
                   size="sm"
-                  disabled={!selectedAddress || !zone}
+                  disabled={!selectedAddress || !zone || !scenePrompt.trim() || isAiAnalyzing}
+                  onClick={handleAnalyzePrompt}
                   className="bg-primary text-white hover:bg-primary/90"
                 >
-                  Analyze
+                  {isAiAnalyzing ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    "Analyze"
+                  )}
                 </Button>
                 </div>
               </div>
@@ -1084,10 +1139,39 @@ export function PLUDashboard({ isAuthenticated = false }: PLUDashboardProps) {
                 </p>
               </div>
             </div>
+            <div className="mb-3 flex flex-wrap items-center gap-2 px-1">
+              {[
+                { key: "massing", label: "Volume Brut" },
+                { key: "house", label: "Maison (R+1)" },
+                { key: "collective", label: "Collectif" },
+                { key: "mixed", label: "Mixte (Commerces RDC)" },
+              ].map((option) => {
+                const isActive = buildingTypology === option.key;
+                return (
+                  <button
+                    key={option.key}
+                    type="button"
+                    onClick={() =>
+                      setBuildingTypology(
+                        option.key as "massing" | "house" | "collective" | "mixed"
+                      )
+                    }
+                    className={`text-xs px-3 py-1.5 rounded-lg transition-all ${
+                      isActive
+                        ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/30"
+                        : "bg-white/5 hover:bg-white/10 text-slate-300 border border-white/10"
+                    }`}
+                  >
+                    {option.label}
+                  </button>
+                );
+              })}
+            </div>
             <div className="relative h-[440px] w-full overflow-hidden rounded-2xl border border-white/[0.06] bg-slate-950/80">
               <ParcelScene
                 ref={parcelSceneRef}
                 pluData={parcelSceneData}
+                buildingTypology={buildingTypology}
                 fillContainer
                 mapZoom={mapZoom}
                 sunTime={sunTime}

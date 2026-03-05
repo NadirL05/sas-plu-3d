@@ -9,6 +9,13 @@ import {
   integer,
   index,
 } from "drizzle-orm/pg-core";
+import type {
+  ZoneUrba,
+  ParcelPolygon,
+  DvfSummary,
+  GeorisquesSummary,
+  PromoterBalance,
+} from "../lib/plu-engine";
 
 // Tables better-auth
 export const user = pgTable("user", {
@@ -100,6 +107,71 @@ export const projects = pgTable("projects", {
   metadata: jsonb("metadata").$type<Record<string, unknown>>(),
 });
 
+export const feasibilityStudy = pgTable(
+  "feasibility_study",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    projectId: uuid("project_id").references(() => projects.id, { onDelete: "cascade" }),
+    userId: text("user_id")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    // Adresse
+    address: text("address").notNull(),
+    lon: text("lon").notNull(),
+    lat: text("lat").notNull(),
+    inseeCode: text("insee_code"),
+    // Snapshots JSON des résultats APIs
+    zoning: jsonb("zoning").$type<ZoneUrba | null>(),
+    parcel: jsonb("parcel").$type<ParcelPolygon | null>(),
+    dvfSummary: jsonb("dvf_summary").$type<DvfSummary | null>(),
+    georisquesSummary: jsonb("georisques_summary").$type<GeorisquesSummary | null>(),
+    promoterBalance: jsonb("promoter_balance").$type<PromoterBalance | null>(),
+    // Champs produit
+    status: text("status", { enum: ["PENDING", "GO", "NO_GO"] })
+      .$type<"PENDING" | "GO" | "NO_GO">()
+      .default("PENDING")
+      .notNull(),
+    note: text("note"),
+    publicShareId: text("public_share_id").unique(),
+    publicShareEnabled: boolean("public_share_enabled").default(false).notNull(),
+    aiSummary: jsonb("ai_summary").$type<{
+      synthesis: string;
+      watchPoints: string[];
+      recommendations: string[];
+    } | null>(),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+    updatedAt: timestamp("updated_at")
+      .defaultNow()
+      .$onUpdate(() => new Date())
+      .notNull(),
+  },
+  (table) => [
+    index("feasibility_study_user_id_idx").on(table.userId),
+    index("feasibility_study_project_id_idx").on(table.projectId),
+    index("feasibility_study_public_share_id_idx").on(table.publicShareId),
+  ],
+);
+
+export const feasibilityScenario = pgTable(
+  "feasibility_scenario",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    feasibilityStudyId: uuid("feasibility_study_id")
+      .notNull()
+      .references(() => feasibilityStudy.id, { onDelete: "cascade" }),
+    name: text("name").notNull(),
+    coveragePct: integer("coverage_pct").notNull(),
+    maxHeightM: integer("max_height_m").notNull(),
+    promoterBalance: jsonb("promoter_balance").$type<PromoterBalance | null>(),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+    updatedAt: timestamp("updated_at")
+      .defaultNow()
+      .$onUpdate(() => new Date())
+      .notNull(),
+  },
+  (table) => [index("feasibility_scenario_study_id_idx").on(table.feasibilityStudyId)],
+);
+
 export const subscription = pgTable(
   "subscription",
   {
@@ -139,6 +211,7 @@ export const userRelations = relations(user, ({ many }) => ({
   accounts: many(account),
   projects: many(projects),
   subscriptions: many(subscription),
+  feasibilityStudies: many(feasibilityStudy),
 }));
 
 export const sessionRelations = relations(session, ({ one }) => ({
@@ -155,10 +228,30 @@ export const accountRelations = relations(account, ({ one }) => ({
   }),
 }));
 
-export const projectsRelations = relations(projects, ({ one }) => ({
+export const projectsRelations = relations(projects, ({ one, many }) => ({
   user: one(user, {
     fields: [projects.userId],
     references: [user.id],
+  }),
+  feasibilityStudies: many(feasibilityStudy),
+}));
+
+export const feasibilityStudyRelations = relations(feasibilityStudy, ({ one, many }) => ({
+  project: one(projects, {
+    fields: [feasibilityStudy.projectId],
+    references: [projects.id],
+  }),
+  user: one(user, {
+    fields: [feasibilityStudy.userId],
+    references: [user.id],
+  }),
+  scenarios: many(feasibilityScenario),
+}));
+
+export const feasibilityScenarioRelations = relations(feasibilityScenario, ({ one }) => ({
+  study: one(feasibilityStudy, {
+    fields: [feasibilityScenario.feasibilityStudyId],
+    references: [feasibilityStudy.id],
   }),
 }));
 
@@ -176,10 +269,14 @@ export const schema = {
   account,
   verification,
   projects,
+  feasibilityStudy,
+  feasibilityScenario,
   subscription,
   userRelations,
   sessionRelations,
   accountRelations,
   projectsRelations,
+  feasibilityStudyRelations,
+  feasibilityScenarioRelations,
   subscriptionRelations,
 };
