@@ -5,7 +5,7 @@ import { getCache, setCache } from "./redis";
  * PLU Engine – extraction robuste des données d'urbanisme
  *
  * 1. Géocodage via l'API Adresse (api-adresse.data.gouv.fr)
- * 2. Zonage GPU via PostGIS local (plu_zones) — fallback WFS si absent
+ * 2. Zonage GPU via PostGIS local (plu_zones)
  * 3. Parcelle cadastrale via l'API Cadastre (Etalab)
  */
 
@@ -25,6 +25,43 @@ function getNeonSql(): ReturnType<typeof neon> | null {
   _neonSql = neon(url);
   return _neonSql;
 }
+export async function lookupZoneFromDatabase(
+  lon: number,
+  lat: number
+): Promise<{ libelle: string; typezone: string; urlfic?: string } | null> {
+  const sql = getNeonSql();
+  if (!sql) return null;
+
+  try {
+    type ZoneRow = {
+      libelle: string | null;
+      typezone: string | null;
+      urlfic: string | null;
+    };
+
+    const rows = (await sql`
+      SELECT libelle, typezone, urlfic
+      FROM plu_zones
+      WHERE ST_Intersects(geom, ST_SetSRID(ST_MakePoint(${lon}, ${lat}), 4326))
+      LIMIT 1
+    `) as ZoneRow[];
+
+    if (rows.length === 0) return null;
+
+    const row = rows[0];
+    return {
+      libelle: row.libelle ?? "N/A",
+      typezone: row.typezone ?? "N/A",
+      urlfic: row.urlfic ?? undefined,
+    };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!msg.includes("plu_zones") && !msg.includes("does not exist")) {
+      console.warn("[plu-engine][lookupZoneFromDatabase] Erreur inattendue:", msg);
+    }
+    return null;
+  }
+}
 
 /**
  * Recherche la zone PLU dans la table PostGIS locale `plu_zones`.
@@ -32,49 +69,15 @@ function getNeonSql(): ReturnType<typeof neon> | null {
  * Retourne null si la table est vide ou si la commune n'a pas été importée.
  */
 async function getZoneUrbaFromPostGIS(lon: number, lat: number): Promise<ZoneUrba | null> {
-  const sql = getNeonSql();
-  if (!sql) return null;
+  const zone = await lookupZoneFromDatabase(lon, lat);
+  if (!zone) return null;
 
-  try {
-    type PluZoneRow = {
-      libelle: string | null;
-      typezone: string | null;
-      code_commune: string | null;
-      nomfic: string | null;
-      urlfic: string | null;
-      datappro: string | null;
-    };
-
-    // neon() HTTP mode retourne un tableau de lignes plain objects
-    const rows = (await sql`
-      SELECT libelle, typezone, code_commune, nomfic, urlfic, datappro
-      FROM plu_zones
-      WHERE ST_Intersects(geom, ST_SetSRID(ST_MakePoint(${lon}, ${lat}), 4326))
-      LIMIT 1
-    `) as PluZoneRow[];
-
-    if (rows.length === 0) return null;
-
-    const row = rows[0];
-
-    return {
-      libelle: row.libelle ?? "N/A",
-      typezone: row.typezone ?? "N/A",
-      commune: row.code_commune ?? "N/A",
-      nomfic: row.nomfic ?? undefined,
-      urlfic: row.urlfic ?? undefined,
-      datappro: row.datappro ?? undefined,
-    };
-  } catch (err) {
-    // La table n'existe pas encore (avant le premier import) → on continue avec WFS
-    const msg = err instanceof Error ? err.message : String(err);
-    if (msg.includes("plu_zones") || msg.includes("does not exist")) {
-      // Table absente : pas encore importée, fallback silencieux vers WFS
-    } else {
-      console.warn("[plu-engine][PostGIS] Erreur inattendue:", msg);
-    }
-    return null;
-  }
+  return {
+    libelle: zone.libelle,
+    typezone: zone.typezone,
+    commune: "N/A",
+    urlfic: zone.urlfic,
+  };
 }
 
 // ─── Types publics ────────────────────────────────────────────────────────────
@@ -215,23 +218,16 @@ export class PLUEngineError extends Error {
 
 const ADRESSE_API = "https://api-adresse.data.gouv.fr/search/";
 
-/**
- * Endpoint WFS public du Géoportail de l'Urbanisme (IGN).
- * Clé "essentiels" : accès gratuit, sans authentification.
- */
-const GPU_WFS_URL = "https://data.geopf.fr/wfs/ows";
-const GPU_WFS_VERSION = "2.0.0";
-const GPU_WFS_TYPENAMES = ["wfs_du:zone_urba"] as const;
 const CADASTRE_API_URL = "https://apicarto.ign.fr/api/cadastre/parcelle";
+const IGN_WFS_GPU_URL = "https://data.geopf.fr/wfs/ows";
+const IGN_SPOOFED_USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
 const DVF_API_BASE_URL = "http://api.cquest.org/dvf";
 const DVF_API_FALLBACK_URL = "https://app.dvf.etalab.gouv.fr/api/mutations3";
 const GEORISQUES_API_BASE_URL = "https://georisques.gouv.fr/api/v1";
 
 /** Délai maximum en ms avant d'abandonner une requête externe. */
 const FETCH_TIMEOUT_MS = 8_000;
-const WFS_TIMEOUT_MS = 12_000;
-const WFS_MAX_RETRIES = 3;
-const WFS_RETRY_DELAY_MS = 180;
 const DVF_TIMEOUT_MS = 3_000;
 const DVF_MAX_RETRIES = 0;
 const GEORISQUES_TIMEOUT_MS = 7_000;
@@ -271,6 +267,59 @@ async function fetchWithTimeout(
   }
 }
 
+async function fetchIgnWithRetry(
+  url: string,
+  options: RequestInit = {},
+  maxRetries = 3,
+  timeoutMs = FETCH_TIMEOUT_MS
+): Promise<Response> {
+  let lastError: unknown = null;
+
+  for (let i = 0; i <= maxRetries; i += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    const headers = new Headers(options.headers ?? {});
+    headers.set("User-Agent", IGN_SPOOFED_USER_AGENT);
+    headers.set("Accept", "application/json");
+
+    try {
+      const res = await fetch(url, {
+        ...options,
+        headers,
+        signal: controller.signal,
+      });
+
+      if (res.status >= 500 && i < maxRetries) {
+        await delay(1000 * Math.pow(2, i));
+        continue;
+      }
+
+      return res;
+    } catch (error) {
+      lastError = error;
+      if (i < maxRetries) {
+        await delay(1000 * Math.pow(2, i));
+        continue;
+      }
+
+      if (error instanceof Error && error.name === "AbortError") {
+        throw new PLUEngineError(
+          `Délai dépassé (${timeoutMs}ms) lors de la requête IGN vers ${url}`,
+          "TIMEOUT"
+        );
+      }
+
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  if (lastError instanceof Error) {
+    throw lastError;
+  }
+  throw new Error(`Échec de la requête IGN: ${url}`);
+}
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -286,21 +335,6 @@ function isFiniteCoord(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
 }
 
-function buildZoneWfsUrl(typeName: string, lon: number, lat: number): string {
-  const params = new URLSearchParams({
-    service: "WFS",
-    version: GPU_WFS_VERSION,
-    request: "GetFeature",
-    typeName,
-    outputFormat: "application/json",
-    // WFS 2.0 / EPSG:4326 axis order on this endpoint is lat lon (y x), not lon lat.
-    CQL_FILTER: `INTERSECTS(the_geom,POINT(${lat} ${lon}))`,
-    maxFeatures: "1",
-  });
-
-  return `${GPU_WFS_URL}?${params.toString()}`;
-}
-
 function pickStringProperty(
   properties: Record<string, unknown>,
   keys: string[]
@@ -312,12 +346,6 @@ function pickStringProperty(
     }
   }
   return undefined;
-}
-
-function buildGpuFileUrl(documentId: string, filename: string): string {
-  return `https://www.geoportail-urbanisme.gouv.fr/api/document/${encodeURIComponent(
-    documentId
-  )}/files/${encodeURIComponent(filename)}`;
 }
 
 function toFiniteNumber(value: unknown): number | null {
@@ -681,17 +709,14 @@ export async function searchAddresses(
 // ─── Zonage GPU ───────────────────────────────────────────────────────────────
 
 /**
- * Interroge le WFS du GPU pour trouver la zone d'urbanisme à un point GPS.
- * Filtre spatial CQL : INTERSECTS(the_geom, POINT(lon lat))
- *
- * @param lon - Longitude (WGS84, plage valide : -5.5 à 9.6 pour la France métropolitaine)
- * @param lat - Latitude  (WGS84, plage valide : 41 à 51.2 pour la France métropolitaine)
+ * Recherche la zone d'urbanisme via PostGIS, puis fallback WFS IGN.
+ * @param lon - Longitude (WGS84)
+ * @param lat - Latitude (WGS84)
  */
 export async function getZoneUrba(
   lon: number,
   lat: number
 ): Promise<ZoneUrba | null> {
-  // Validation basique des coordonnées (France métropolitaine + outremer)
   if (!isFinite(lon) || !isFinite(lat)) {
     throw new PLUEngineError(
       `Coordonnées invalides : lon=${lon}, lat=${lat}`,
@@ -699,130 +724,74 @@ export async function getZoneUrba(
     );
   }
 
-  // ── Tentative PostGIS locale (si plu_zones est importée) ──────────────────
   const postgisResult = await getZoneUrbaFromPostGIS(lon, lat);
   if (postgisResult) {
-    console.log(`[plu-engine][PostGIS] Zone trouvée pour (${lon}, ${lat}): ${postgisResult.typezone} ${postgisResult.libelle}`);
     return postgisResult;
   }
 
-  // ── Fallback : WFS GPU en live (IGN) ──────────────────────────────────────
-  console.log(`[plu-engine][WFS] PostGIS vide pour (${lon}, ${lat}), fallback WFS…`);
+  const params = new URLSearchParams({
+    SERVICE: "WFS",
+    VERSION: "2.0.0",
+    REQUEST: "GetFeature",
+    TYPENAMES: "GPU:zone_urba",
+    OUTPUTFORMAT: "application/json",
+    SRSNAME: "EPSG:4326",
+    COUNT: "1",
+    CQL_FILTER: `INTERSECTS(geom,POINT(${lon} ${lat}))`,
+  });
+  const wfsUrl = `${IGN_WFS_GPU_URL}?${params.toString()}`;
 
-  let lastError: unknown = null;
-  let lastFailedWfsUrl: string | null = null;
-
-  for (const typeName of GPU_WFS_TYPENAMES) {
-    const requestUrl = buildZoneWfsUrl(typeName, lon, lat);
-    console.log(`[plu-engine][getZoneUrba] WFS URL: ${requestUrl}`);
-    lastFailedWfsUrl = requestUrl;
-
-    for (let attempt = 0; attempt <= WFS_MAX_RETRIES; attempt += 1) {
-      try {
-        const res = await fetchWithTimeout(requestUrl, { cache: "no-store" }, WFS_TIMEOUT_MS);
-
-        if (!res.ok) {
-          if (attempt < WFS_MAX_RETRIES && (res.status >= 500 || res.status === 429)) {
-            await delay(WFS_RETRY_DELAY_MS * (attempt + 1));
-            continue;
-          }
-          throw new PLUEngineError(
-            `GPU WFS a répondu avec ${res.status} ${res.statusText} (${typeName})`,
-            "WFS_FAILED"
-          );
-        }
-
-        const data = await res.json();
-        if (!Array.isArray(data?.features) || data.features.length === 0) {
-          break;
-        }
-
-        const properties = (data.features[0]?.properties ?? {}) as Record<string, unknown>;
-        const nomfic = pickStringProperty(properties, ["nomfic", "NOMFIC"]);
-        const urlfic =
-          pickStringProperty(properties, ["urlfic", "URLFIC"]) ??
-          (() => {
-            const gpuDocId = pickStringProperty(properties, ["gpu_doc_id", "GPU_DOC_ID"]);
-            if (!gpuDocId || !nomfic) return undefined;
-            return buildGpuFileUrl(gpuDocId, nomfic);
-          })();
-
-        // Géoplateforme / WFS + variantes CNIG (casse / alias).
-        return {
-          libelle:
-            pickStringProperty(properties, [
-              "libelle",
-              "LIBELLE",
-              "libelong",
-              "LIBELONG",
-              "zone",
-              "lib_zone",
-            ]) ?? "N/A",
-          typezone:
-            pickStringProperty(properties, ["typezone", "TYPEZONE", "type_zone", "TYPE_ZONE"]) ??
-            "N/A",
-          commune:
-            pickStringProperty(properties, [
-              "commune",
-              "COMMUNE",
-              "nomcom",
-              "NOMCOM",
-              "libcom",
-              "LIBCOM",
-              "nom_commune",
-              "NOM_COMMUNE",
-              "insee",
-              "INSEE",
-            ]) ?? "N/A",
-          nomfic,
-          urlfic,
-          datappro: pickStringProperty(properties, ["datappro", "DATAPPRO"]),
-        };
-      } catch (error) {
-        lastError = error;
-        const isTimeout = error instanceof PLUEngineError && error.code === "TIMEOUT";
-        const isNetworkError = isNetworkFetchError(error);
-        const hasRetry = attempt < WFS_MAX_RETRIES;
-
-        if ((isTimeout || isNetworkError) && hasRetry) {
-          await delay(WFS_RETRY_DELAY_MS * (attempt + 1));
-          continue;
-        }
-        break;
-      }
-    }
-  }
-
-  if (lastError instanceof PLUEngineError && lastError.code === "TIMEOUT") {
-    console.warn(
-      `[plu-engine] Timeout esquivé sur ${lastFailedWfsUrl ?? "WFS"}, passage au fallback.`
+  try {
+    const res = await fetchIgnWithRetry(
+      wfsUrl,
+      { cache: "no-store" },
+      3,
+      FETCH_TIMEOUT_MS
     );
-    return null;
-  }
-  if (lastError instanceof PLUEngineError) {
-    throw lastError;
-  }
-  if (lastError && isNetworkFetchError(lastError)) {
-    if (lastFailedWfsUrl) {
-      console.warn(
-        `[plu-engine][getZoneUrba] Echec WFS (URL testable): ${lastFailedWfsUrl}`,
-        lastError
-      );
-    }
-    const detail = lastError instanceof Error ? lastError.message : "fetch failed";
-    throw new PLUEngineError(`Erreur réseau GPU WFS (${detail})`, "WFS_FAILED");
-  }
-  if (lastError) {
-    if (lastFailedWfsUrl) {
-      console.warn(
-        `[plu-engine][getZoneUrba] Echec WFS (URL testable): ${lastFailedWfsUrl}`,
-        lastError
-      );
-    }
-    throw new PLUEngineError("Erreur inconnue lors de l'appel au GPU WFS.", "WFS_FAILED");
-  }
 
-  return null;
+    if (!res.ok) {
+      throw new PLUEngineError(
+        `WFS IGN a répondu avec ${res.status} ${res.statusText}`,
+        "WFS_FAILED"
+      );
+    }
+
+    const data = (await res.json()) as {
+      features?: Array<{ properties?: Record<string, unknown> }>;
+    };
+    const properties = data.features?.[0]?.properties;
+    if (!properties || typeof properties !== "object") {
+      console.warn(`[plu-engine][WFS] Aucune zone IGN trouvée pour (${lon}, ${lat}).`);
+      return null;
+    }
+
+    const libelle =
+      pickStringProperty(properties, ["libelle", "LIBELLE", "zone", "libelle_zone"]) ??
+      "N/A";
+    const typezone =
+      pickStringProperty(properties, ["typezone", "TYPEZONE", "type_zone"]) ?? libelle;
+    const commune =
+      pickStringProperty(properties, ["commune", "nom_com", "code_insee", "insee"]) ??
+      "N/A";
+    const nomfic = pickStringProperty(properties, ["nomfic", "nom_fic"]);
+    const urlfic = pickStringProperty(properties, ["urlfic", "url_fic", "url_document"]);
+    const datappro = pickStringProperty(properties, ["datappro", "date_appro"]);
+
+    return {
+      libelle,
+      typezone,
+      commune,
+      nomfic: nomfic ?? undefined,
+      urlfic: urlfic ?? undefined,
+      datappro: datappro ?? undefined,
+    };
+  } catch (error) {
+    if (error instanceof PLUEngineError) {
+      throw error;
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    throw new PLUEngineError(`Échec du fallback WFS IGN: ${message}`, "WFS_FAILED");
+  }
 }
 
 // ─── Parcelle cadastrale ─────────────────────────────────────────────────────
@@ -1460,3 +1429,5 @@ export async function lookupPLU(address: string): Promise<PLUResult | null> {
 
   return { address: best, zone, parcel };
 }
+
+

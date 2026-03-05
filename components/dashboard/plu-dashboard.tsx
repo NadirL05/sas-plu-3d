@@ -29,6 +29,7 @@ import { toast } from "sonner";
 import { ResponsiveContainer, AreaChart, Area, XAxis, YAxis, Tooltip } from "recharts";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
+import { uploadFiles } from "@/src/utils/uploadthing";
 import {
   lookupDvfAction,
   lookupGeorisquesAction,
@@ -163,27 +164,30 @@ function buildSyntheticAddressSuggestion(lon: number, lat: number): AddressSugge
   };
 }
 
-function extractUploadedUrl(payload: unknown): string | null {
-  if (!payload || typeof payload !== "object") return null;
-  const data = payload as Record<string, unknown>;
-
-  const direct = data.url;
-  if (typeof direct === "string" && /^https?:\/\//.test(direct)) return direct;
-
-  const fileUrl = (data.file as Record<string, unknown> | undefined)?.url;
-  if (typeof fileUrl === "string" && /^https?:\/\//.test(fileUrl)) return fileUrl;
-
-  const files = data.files;
-  if (Array.isArray(files) && files.length > 0) {
-    const first = files[0] as Record<string, unknown>;
-    if (typeof first?.url === "string" && /^https?:\/\//.test(first.url)) {
-      return first.url;
-    }
+function dataURLtoFile(dataurl: string, filename: string): File {
+  const [meta, encoded] = dataurl.split(",");
+  if (!meta || !encoded) {
+    throw new Error("Format data URL invalide.");
   }
 
-  return null;
-}
+  const mimeMatch = meta.match(/^data:([^;]+);base64$/);
+  if (!mimeMatch) {
+    throw new Error("MIME type introuvable dans la capture.");
+  }
 
+  const mime = mimeMatch[1];
+  const binary = atob(encoded);
+  const bytes = new Uint8Array(binary.length);
+
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+
+  const extension = mime.includes("jpeg") ? "jpg" : mime.includes("webp") ? "webp" : "png";
+  const fileName = filename.endsWith(`.${extension}`) ? filename : `${filename}.${extension}`;
+
+  return new File([bytes], fileName, { type: mime });
+}
 function buildParcelSceneData(
   zone: ZoneUrba | null | undefined,
   parcel: ParcelPolygon | null,
@@ -295,7 +299,7 @@ export function PLUDashboard({ isAuthenticated = false }: PLUDashboardProps) {
   const [mapCenter, setMapCenter] = useState(DEFAULT_MAP_CENTER);
   const [mapZoom, setMapZoom] = useState(14);
   const [sunTime, setSunTime] = useState(14);
-  const [buildingTypology, setBuildingTypology] = useState<
+  const [buildingType, setBuildingType] = useState<
     "massing" | "house" | "collective" | "mixed"
   >("collective");
   const [isMapReady, setIsMapReady] = useState(false);
@@ -327,12 +331,15 @@ export function PLUDashboard({ isAuthenticated = false }: PLUDashboardProps) {
   const parcelSceneRef = useRef<ParcelSceneHandle | null>(null);
   const [currentProjectId, setCurrentProjectId] = useState<string | null>(null);
   const [isPluAnalyzing, setIsPluAnalyzing] = useState(false);
+  const [isUploadingPluPdf, setIsUploadingPluPdf] = useState(false);
+  const [uploadedPluPdfUrl, setUploadedPluPdfUrl] = useState<string | null>(null);
   const [pluAnalysisStatus, setPluAnalysisStatus] = useState<string | null>(null);
   const [pluAnalysisData, setPluAnalysisData] = useState<{
     ces: string;
     retrait: string;
     espacesVerts: string;
   } | null>(null);
+  const activePluPdfUrl = uploadedPluPdfUrl ?? zone?.urlfic ?? null;
 
   const handleExportObj = useCallback(() => {
     if (!parcelSceneRef.current) return;
@@ -400,6 +407,9 @@ export function PLUDashboard({ isAuthenticated = false }: PLUDashboardProps) {
     setDvfSummary(null);
     setGeorisquesSummary(null);
     setSaveState("idle");
+    setUploadedPluPdfUrl(null);
+    setPluAnalysisData(null);
+    setPluAnalysisStatus(null);
     setIsLoadingZone(true);
     setIsLoadingDvf(true);
     setIsLoadingRisks(true);
@@ -653,9 +663,46 @@ export function PLUDashboard({ isAuthenticated = false }: PLUDashboardProps) {
     toast.error(result.error ?? "Erreur lors de l'enregistrement.");
   }, [selectedAddress, zone]);
 
+  const handlePluPdfUpload = useCallback(
+    async (event: React.ChangeEvent<HTMLInputElement>) => {
+      const input = event.currentTarget;
+      const file = input.files?.[0];
+
+      if (!file) return;
+
+      setIsUploadingPluPdf(true);
+
+      try {
+        const uploaded = await uploadFiles({
+          endpoint: "pluPdfUploader",
+          files: [file],
+        });
+
+        const first = uploaded[0] as { url?: string; ufsUrl?: string } | undefined;
+        const uploadedUrl = first?.url ?? first?.ufsUrl ?? null;
+
+        if (!uploadedUrl) {
+          throw new Error("Upload PDF réussi mais URL absente.");
+        }
+
+        setUploadedPluPdfUrl(uploadedUrl);
+        setPluAnalysisData(null);
+        setPluAnalysisStatus(null);
+        toast.success("PDF réglementaire importé.");
+      } catch (error) {
+        console.error("[handlePluPdfUpload]", error);
+        toast.error("Upload du PDF réglementaire impossible.");
+      } finally {
+        input.value = "";
+        setIsUploadingPluPdf(false);
+      }
+    },
+    []
+  );
+
   const handleAnalyzePluPdf = useCallback(async () => {
-    if (!zone?.urlfic) {
-      toast.error("Aucun PDF réglementaire associé à cette zone.");
+    if (!activePluPdfUrl) {
+      toast.error("Importez un PDF réglementaire ou sélectionnez une zone avec document.");
       return;
     }
 
@@ -682,7 +729,7 @@ export function PLUDashboard({ isAuthenticated = false }: PLUDashboardProps) {
       const response = await fetch("/api/plu/analyze-pdf", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ urlfic: zone.urlfic }),
+        body: JSON.stringify({ urlfic: activePluPdfUrl }),
       });
 
       if (!response.ok) {
@@ -696,9 +743,9 @@ export function PLUDashboard({ isAuthenticated = false }: PLUDashboardProps) {
       };
 
       setPluAnalysisData({
-        ces: data.ces ?? "40%",
-        retrait: data.retrait ?? "4m",
-        espacesVerts: data.espacesVerts ?? "30%",
+        ces: data.ces ?? "Non spécifié",
+        retrait: data.retrait ?? "Non spécifié",
+        espacesVerts: data.espacesVerts ?? "Non spécifié",
       });
       setPluAnalysisStatus("Analyse terminée");
     } catch (error) {
@@ -709,7 +756,7 @@ export function PLUDashboard({ isAuthenticated = false }: PLUDashboardProps) {
       stepTimeouts.forEach((id) => window.clearTimeout(id));
       setIsPluAnalyzing(false);
     }
-  }, [zone?.urlfic]);
+  }, [activePluPdfUrl]);
 
   const handleAnalyzePrompt = useCallback(async () => {
     if (!scenePrompt.trim() || !selectedAddress) return;
@@ -762,28 +809,17 @@ export function PLUDashboard({ isAuthenticated = false }: PLUDashboardProps) {
 
   const uploadSceneCapture = useCallback(
     async (sceneImageDataUrl: string, projectId: string): Promise<string | null> => {
-      const response = await fetch("/api/media/upload-scene", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          projectId,
-          imageDataUrl: sceneImageDataUrl,
-        }),
+      const file = dataURLtoFile(sceneImageDataUrl, `scene-${projectId}`);
+      const uploaded = await uploadFiles({
+        endpoint: "sceneCaptureUploader",
+        files: [file],
       });
 
-      if (!response.ok) {
-        const data = (await response.json().catch(() => null)) as
-          | { error?: string }
-          | null;
-        throw new Error(data?.error ?? "Upload externe indisponible.");
-      }
-
-      const data = (await response.json()) as unknown;
-      return extractUploadedUrl(data);
+      const first = uploaded[0] as { url?: string; ufsUrl?: string } | undefined;
+      return first?.url ?? first?.ufsUrl ?? null;
     },
     []
   );
-
   const handleExportReport = useCallback(async () => {
     if (!selectedAddress || !zone) return;
 
@@ -1139,27 +1175,27 @@ export function PLUDashboard({ isAuthenticated = false }: PLUDashboardProps) {
                 </p>
               </div>
             </div>
-            <div className="mb-3 flex flex-wrap items-center gap-2 px-1">
+            <div className="mb-3 ml-1 inline-flex flex-wrap items-center gap-1.5 rounded-xl border border-white/10 bg-slate-950/55 p-1.5 shadow-[0_12px_30px_rgba(2,6,23,0.45)] backdrop-blur-xl">
               {[
-                { key: "massing", label: "Volume Brut" },
-                { key: "house", label: "Maison (R+1)" },
-                { key: "collective", label: "Collectif" },
-                { key: "mixed", label: "Mixte (Commerces RDC)" },
+                { key: "massing", label: "Volume Max" },
+                { key: "house", label: "Maison R+1" },
+                { key: "collective", label: "Résidentiel" },
+                { key: "mixed", label: "Mixte (Commerces)" },
               ].map((option) => {
-                const isActive = buildingTypology === option.key;
+                const isActive = buildingType === option.key;
                 return (
                   <button
                     key={option.key}
                     type="button"
                     onClick={() =>
-                      setBuildingTypology(
+                      setBuildingType(
                         option.key as "massing" | "house" | "collective" | "mixed"
                       )
                     }
-                    className={`text-xs px-3 py-1.5 rounded-lg transition-all ${
+                    className={`rounded-lg border px-3 py-1.5 text-xs font-medium transition-all ${
                       isActive
-                        ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/30"
-                        : "bg-white/5 hover:bg-white/10 text-slate-300 border border-white/10"
+                        ? "bg-emerald-500/20 text-emerald-400 border-emerald-500/30"
+                        : "border-white/10 bg-white/[0.04] text-slate-300 hover:bg-white/[0.09]"
                     }`}
                   >
                     {option.label}
@@ -1171,7 +1207,7 @@ export function PLUDashboard({ isAuthenticated = false }: PLUDashboardProps) {
               <ParcelScene
                 ref={parcelSceneRef}
                 pluData={parcelSceneData}
-                buildingTypology={buildingTypology}
+                buildingType={buildingType}
                 fillContainer
                 mapZoom={mapZoom}
                 sunTime={sunTime}
@@ -1261,49 +1297,79 @@ export function PLUDashboard({ isAuthenticated = false }: PLUDashboardProps) {
                 Limite de hauteur réglementaire pour la zone active.
               </p>
 
-              {zone?.urlfic ? (
-                <div className="mt-4 space-y-2">
-                  <button
-                    type="button"
-                    onClick={handleAnalyzePluPdf}
-                    disabled={isPluAnalyzing}
-                    className="group relative inline-flex rounded-full bg-gradient-to-r from-emerald-400 via-sky-500 to-indigo-500 p-[1px] text-[11px] font-semibold text-emerald-50 shadow-[0_0_24px_rgba(56,189,248,0.45)]"
-                  >
-                    <span className="absolute inset-0 rounded-full bg-[radial-gradient(circle_at_top_left,rgba(56,189,248,0.75),transparent_60%)] opacity-70 mix-blend-screen blur-sm" />
-                    <span className="relative flex items-center gap-2 rounded-full bg-slate-950/95 px-3 py-1 group-hover:bg-slate-950">
-                      <Sparkles className="h-3 w-3 text-emerald-300" />
-                      Analyser le PDF réglementaire avec l&apos;IA
-                    </span>
-                  </button>
-
-                  {isPluAnalyzing ? (
-                    <div className="mt-2 space-y-1">
-                      <p className="text-[11px] text-emerald-200">
-                        {pluAnalysisStatus ?? "Téléchargement du document..."}
-                      </p>
-                      <div className="flex flex-col gap-1">
-                        <div className="h-1.5 w-full animate-pulse rounded-full bg-emerald-500/25" />
-                        <div className="h-1.5 w-5/6 animate-pulse rounded-full bg-emerald-500/15" />
-                        <div className="h-1.5 w-2/3 animate-pulse rounded-full bg-emerald-500/10" />
-                      </div>
-                    </div>
-                  ) : null}
-
-                  {pluAnalysisData && !isPluAnalyzing ? (
-                    <div className="mt-3 flex flex-wrap gap-2">
-                      <span className="inline-flex items-center rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1 text-[10px] font-semibold text-emerald-200">
-                        CES : {pluAnalysisData.ces}
-                      </span>
-                      <span className="inline-flex items-center rounded-full border border-sky-500/40 bg-sky-500/10 px-2.5 py-1 text-[10px] font-semibold text-sky-200">
-                        Retrait : {pluAnalysisData.retrait}
-                      </span>
-                      <span className="inline-flex items-center rounded-full border border-lime-400/40 bg-lime-400/10 px-2.5 py-1 text-[10px] font-semibold text-lime-100">
-                        Espaces verts : {pluAnalysisData.espacesVerts}
-                      </span>
-                    </div>
-                  ) : null}
+              <div className="mt-4 space-y-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  <label className="inline-flex cursor-pointer items-center rounded-full border border-white/15 bg-white/[0.06] px-3 py-1 text-[11px] font-semibold text-slate-200 transition hover:bg-white/[0.12]">
+                    <input
+                      type="file"
+                      accept="application/pdf"
+                      onChange={handlePluPdfUpload}
+                      className="hidden"
+                      disabled={isUploadingPluPdf || isPluAnalyzing}
+                    />
+                    {isUploadingPluPdf ? "Import du PDF..." : "Importer un PDF PLU"}
+                  </label>
+                  <span className="inline-flex items-center rounded-full border border-emerald-500/35 bg-emerald-500/10 px-2.5 py-1 text-[10px] font-semibold text-emerald-200">
+                    {activePluPdfUrl ? "PDF prêt pour analyse" : "Aucun PDF sélectionné"}
+                  </span>
                 </div>
-              ) : null}
+
+                {activePluPdfUrl ? (
+                  <a
+                    href={activePluPdfUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center gap-1 text-[11px] text-sky-300 transition hover:text-sky-200"
+                  >
+                    Voir le document actif
+                    <ExternalLink className="h-3 w-3" />
+                  </a>
+                ) : (
+                  <p className="text-[11px] text-slate-500">
+                    Importez un PDF réglementaire pour lancer l&apos;analyse IA.
+                  </p>
+                )}
+
+                <button
+                  type="button"
+                  onClick={handleAnalyzePluPdf}
+                  disabled={isPluAnalyzing || isUploadingPluPdf || !activePluPdfUrl}
+                  className="group relative inline-flex rounded-full bg-gradient-to-r from-emerald-400 via-sky-500 to-indigo-500 p-[1px] text-[11px] font-semibold text-emerald-50 shadow-[0_0_24px_rgba(56,189,248,0.45)] disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <span className="absolute inset-0 rounded-full bg-[radial-gradient(circle_at_top_left,rgba(56,189,248,0.75),transparent_60%)] opacity-70 mix-blend-screen blur-sm" />
+                  <span className="relative flex items-center gap-2 rounded-full bg-slate-950/95 px-3 py-1 group-hover:bg-slate-950">
+                    <Sparkles className="h-3 w-3 text-emerald-300" />
+                    Analyser le PDF réglementaire avec l&apos;IA
+                  </span>
+                </button>
+
+                {isPluAnalyzing ? (
+                  <div className="mt-2 space-y-1">
+                    <p className="text-[11px] text-emerald-200">
+                      {pluAnalysisStatus ?? "Téléchargement du document..."}
+                    </p>
+                    <div className="flex flex-col gap-1">
+                      <div className="h-1.5 w-full animate-pulse rounded-full bg-emerald-500/25" />
+                      <div className="h-1.5 w-5/6 animate-pulse rounded-full bg-emerald-500/15" />
+                      <div className="h-1.5 w-2/3 animate-pulse rounded-full bg-emerald-500/10" />
+                    </div>
+                  </div>
+                ) : null}
+
+                {pluAnalysisData && !isPluAnalyzing ? (
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    <span className="inline-flex items-center rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2.5 py-1 text-[10px] font-semibold text-emerald-200">
+                      CES : {pluAnalysisData.ces}
+                    </span>
+                    <span className="inline-flex items-center rounded-full border border-sky-500/40 bg-sky-500/10 px-2.5 py-1 text-[10px] font-semibold text-sky-200">
+                      Retrait : {pluAnalysisData.retrait}
+                    </span>
+                    <span className="inline-flex items-center rounded-full border border-lime-400/40 bg-lime-400/10 px-2.5 py-1 text-[10px] font-semibold text-lime-100">
+                      Espaces verts : {pluAnalysisData.espacesVerts}
+                    </span>
+                  </div>
+                ) : null}
+              </div>
             </div>
 
             <div
@@ -1844,3 +1910,4 @@ export function PLUDashboard({ isAuthenticated = false }: PLUDashboardProps) {
     </div>
   );
 }
+

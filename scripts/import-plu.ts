@@ -94,25 +94,16 @@ async function setupDatabase(sql: any): Promise<void> {
   await sql`
     CREATE TABLE IF NOT EXISTS plu_zones (
       id            BIGSERIAL PRIMARY KEY,
-      code_commune  TEXT        NOT NULL,     -- Code INSEE 5 chiffres (ex: "13055")
-      libelle       TEXT,                     -- Libellé court de la zone (ex: "UA")
-      typezone      TEXT,                     -- Catégorie : U | AU | N | A
-      nomfic        TEXT,                     -- Nom du fichier réglementaire
-      urlfic        TEXT,                     -- URL du PDF réglementaire
-      datappro      TEXT,                     -- Date d'approbation (ISO)
+      code_commune  TEXT        NOT NULL,
+      libelle       TEXT,
+      typezone      TEXT,
+      urlfic        TEXT,
       geom          GEOMETRY(MULTIPOLYGON, 4326) NOT NULL
     )
   `;
 
-  // Compatibilité avec les schémas historiques créés avant l'ajout de datappro.
   await sql`
-    ALTER TABLE plu_zones
-    ADD COLUMN IF NOT EXISTS datappro TEXT
-  `;
-
-  // Index spatial GIST pour ST_Intersects ultra-rapide
-  await sql`
-    CREATE INDEX IF NOT EXISTS plu_zones_geom_gist_idx
+    CREATE INDEX IF NOT EXISTS plu_zones_geom_idx
     ON plu_zones USING GIST (geom)
   `;
 
@@ -145,9 +136,7 @@ async function importFeatures(
     const codeCommune = String(p.insee ?? "").trim();
     const libelle = String(p.libelle ?? "").trim() || null;
     const typezone = String(p.typezone ?? "").trim() || null;
-    const nomfic = String(p.nomfic ?? "").trim() || null;
     const urlfic = String(p.urlfic ?? "").trim() || null;
-    const datappro = String(p.datappro ?? "").trim() || null;
 
     if (!codeCommune) {
       skipped++;
@@ -158,14 +147,12 @@ async function importFeatures(
 
     try {
       await sql`
-        INSERT INTO plu_zones (code_commune, libelle, typezone, nomfic, urlfic, datappro, geom)
+        INSERT INTO plu_zones (code_commune, libelle, typezone, urlfic, geom)
         VALUES (
           ${codeCommune},
           ${libelle},
           ${typezone},
-          ${nomfic},
           ${urlfic},
-          ${datappro},
           ST_Multi(ST_GeomFromGeoJSON(${geomJson}))
         )
         ON CONFLICT DO NOTHING

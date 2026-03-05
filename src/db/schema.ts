@@ -205,6 +205,15 @@ export const subscription = pgTable(
   ],
 );
 
+
+export const pluAiCache = pgTable("plu_ai_cache", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  urlfic: text("urlfic").notNull().unique(),
+  ces: text("ces").notNull(),
+  retrait: text("retrait").notNull(),
+  espacesVerts: text("espaces_verts").notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
 // Relations
 export const userRelations = relations(user, ({ many }) => ({
   sessions: many(session),
@@ -272,6 +281,7 @@ export const schema = {
   feasibilityStudy,
   feasibilityScenario,
   subscription,
+  pluAiCache,
   userRelations,
   sessionRelations,
   accountRelations,

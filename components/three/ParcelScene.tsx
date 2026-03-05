@@ -47,7 +47,7 @@ export interface ParcelSceneData {
 
 export interface ParcelSceneHandle {
   exportToObj: () => void;
-  buildingTypology?: "massing" | "house" | "collective" | "mixed";
+  buildingType?: BuildingType;
 }
 
 interface ParcelShapeData {
@@ -62,6 +62,7 @@ const DEFAULT_FOOTPRINT = { width: 10, depth: 15 };
 const EARTH_RADIUS_M = 6_378_137;
 const DEG_TO_RAD = Math.PI / 180;
 
+type BuildingType = "massing" | "house" | "collective" | "mixed";
 type RoofStyle = "default" | "flat" | "slope";
 
 interface VisualModifiers {
@@ -404,14 +405,14 @@ function scaleShapes(shapes: THREE.Shape[], scale: number): THREE.Shape[] {
 interface BuildingPreviewProps {
   maxHeight: number;
   footprintShape: ParcelShapeData;
-  buildingTypology?: "massing" | "house" | "collective" | "mixed";
+  buildingType?: BuildingType;
   buildingGroupRef?: React.RefObject<THREE.Group | null>;
 }
 
 function BuildingPreview({
   maxHeight,
   footprintShape,
-  buildingTypology = "collective",
+  buildingType = "collective",
   buildingGroupRef,
 }: BuildingPreviewProps) {
   const FLOOR_HEIGHT = 3;
@@ -420,13 +421,44 @@ function BuildingPreview({
   const localGroupRef = useRef<THREE.Group>(null);
   const groupRef = buildingGroupRef ?? localGroupRef;
   const effectiveHeight = Math.max(0.2, maxHeight);
-  const maxFloors = Math.max(1, Math.floor(effectiveHeight / FLOOR_HEIGHT));
-  const numFloors = buildingTypology === "house" ? Math.min(maxFloors, 2) : maxFloors;
+  const floorsByHeight = Math.max(1, Math.floor(effectiveHeight / FLOOR_HEIGHT));
+  const floors = buildingType === "house" ? Math.min(floorsByHeight, 2) : floorsByHeight;
 
   const slabShapes = useMemo(() => scaleShapes(footprintShape.shapes, 1.02), [footprintShape.shapes]);
   const massingGeometry = useExtrudedGeometry(footprintShape.shapes, effectiveHeight);
   const floorGeometry = useExtrudedGeometry(footprintShape.shapes, WALL_HEIGHT);
   const slabGeometry = useExtrudedGeometry(slabShapes, SLAB_HEIGHT);
+
+  const roofGeometry = useMemo(() => {
+    if (buildingType !== "house") return null;
+
+    const roofWidth = Math.max(2, footprintShape.width * 1.03);
+    const roofDepth = Math.max(2, footprintShape.depth * 1.03);
+    const roofHeight = Math.max(0.8, Math.min(1.6, effectiveHeight * 0.16));
+
+    const roofShape = new THREE.Shape();
+    roofShape.moveTo(-roofWidth / 2, 0);
+    roofShape.lineTo(0, roofHeight);
+    roofShape.lineTo(roofWidth / 2, 0);
+    roofShape.lineTo(-roofWidth / 2, 0);
+
+    const geometry = new THREE.ExtrudeGeometry(roofShape, {
+      depth: roofDepth,
+      bevelEnabled: false,
+      steps: 1,
+      curveSegments: 1,
+    });
+
+    geometry.translate(0, 0, -roofDepth / 2);
+    geometry.computeVertexNormals();
+    return geometry;
+  }, [buildingType, footprintShape.width, footprintShape.depth, effectiveHeight]);
+
+  useEffect(() => {
+    return () => {
+      roofGeometry?.dispose();
+    };
+  }, [roofGeometry]);
 
   useEffect(() => {
     if (!groupRef.current) return;
@@ -448,11 +480,13 @@ function BuildingPreview({
     return () => {
       timeline.kill();
     };
-  }, [buildingTypology, effectiveHeight, numFloors, groupRef]);
+  }, [buildingType, effectiveHeight, floors, groupRef]);
+
+  const roofBaseY = FLOOR_HEIGHT * (floors - 1) + WALL_HEIGHT + 0.02;
 
   return (
     <group ref={groupRef}>
-      {buildingTypology === "massing" ? (
+      {buildingType === "massing" ? (
         <mesh geometry={massingGeometry} castShadow receiveShadow>
           <meshStandardMaterial
             color="#60a5fa"
@@ -463,39 +497,50 @@ function BuildingPreview({
           />
         </mesh>
       ) : (
-        Array.from({ length: numFloors }).map((_, index) => {
-          const isMixedGround = buildingTypology === "mixed" && index === 0;
-          const floorBaseY = FLOOR_HEIGHT * index;
+        <>
+          {Array.from({ length: floors }).map((_, index) => {
+            const isMixedGround = buildingType === "mixed" && index === 0;
+            const floorBaseY = FLOOR_HEIGHT * index;
+            const hasSlabAbove = index < floors - 1;
 
-          return (
-            <group key={`floor-${index}`} position={[0, floorBaseY, 0]}>
-              <mesh geometry={floorGeometry} castShadow receiveShadow>
-                {isMixedGround ? (
-                  <meshPhysicalMaterial
-                    color="#1e293b"
-                    roughness={0.1}
-                    metalness={0.35}
-                    clearcoat={0.25}
-                  />
-                ) : (
-                  <meshStandardMaterial
-                    color="#f8fafc"
-                    roughness={0.9}
-                    metalness={0.05}
-                  />
-                )}
-              </mesh>
-              <mesh geometry={slabGeometry} position={[0, WALL_HEIGHT, 0]} castShadow receiveShadow>
-                <meshStandardMaterial color="#d1d5db" roughness={0.45} metalness={0.08} />
-              </mesh>
-            </group>
-          );
-        })
+            return (
+              <group key={`floor-${index}`} position={[0, floorBaseY, 0]}>
+                <mesh geometry={floorGeometry} castShadow receiveShadow>
+                  {isMixedGround ? (
+                    <meshPhysicalMaterial
+                      color="#0f172a"
+                      roughness={0.08}
+                      metalness={0.18}
+                      clearcoat={0.55}
+                      clearcoatRoughness={0.08}
+                    />
+                  ) : (
+                    <meshStandardMaterial
+                      color="#f8fafc"
+                      roughness={0.92}
+                      metalness={0.03}
+                    />
+                  )}
+                </mesh>
+                {hasSlabAbove ? (
+                  <mesh geometry={slabGeometry} position={[0, WALL_HEIGHT, 0]} castShadow receiveShadow>
+                    <meshStandardMaterial color="#d1d5db" roughness={0.45} metalness={0.08} />
+                  </mesh>
+                ) : null}
+              </group>
+            );
+          })}
+
+          {buildingType === "house" && roofGeometry ? (
+            <mesh geometry={roofGeometry} position={[0, roofBaseY, 0]} castShadow receiveShadow>
+              <meshStandardMaterial color="#8b5e3c" roughness={0.85} metalness={0.02} />
+            </mesh>
+          ) : null}
+        </>
       )}
     </group>
   );
 }
-
 interface SceneFocus {
   width: number;
   depth: number;
@@ -801,7 +846,7 @@ function ParcelTrees({ shape }: { shape: ParcelShapeData }) {
 function SceneContent({
   data,
   modifiers,
-  buildingTypology,
+  buildingType,
   sunTime,
   mapZoom,
   onCaptureReady,
@@ -809,7 +854,7 @@ function SceneContent({
 }: {
   data: ParcelSceneData | null;
   modifiers: VisualModifiers;
-  buildingTypology?: "massing" | "house" | "collective" | "mixed";
+  buildingType?: BuildingType;
   sunTime: number;
   mapZoom?: number;
   onCaptureReady?: (capture: () => string | null) => void;
@@ -984,7 +1029,7 @@ function SceneContent({
         <BuildingPreview
           maxHeight={data.maxHeight}
           footprintShape={footprintShape}
-          buildingTypology={buildingTypology}
+          buildingType={buildingType}
           buildingGroupRef={buildingGroupRef}
         />
       ) : null}
@@ -997,7 +1042,7 @@ function SceneContent({
 interface ParcelSceneProps {
   /** Données PLU pour le volume. Si null, la scène est vide (grille + lumières). */
   pluData: ParcelSceneData | null;
-  buildingTypology?: "massing" | "house" | "collective" | "mixed";
+  buildingType?: BuildingType;
   className?: string;
   promptValue?: string;
   hidePromptInput?: boolean;
@@ -1013,7 +1058,7 @@ export const ParcelScene = forwardRef<ParcelSceneHandle, ParcelSceneProps>(
   function ParcelScene(
     {
       pluData,
-      buildingTypology = "collective",
+      buildingType = "collective",
       className,
       promptValue,
       hidePromptInput = false,
@@ -1059,9 +1104,9 @@ export const ParcelScene = forwardRef<ParcelSceneHandle, ParcelSceneProps>(
       ref,
       () => ({
         exportToObj: handleExportToObj,
-        buildingTypology,
+        buildingType,
       }),
-      [handleExportToObj, buildingTypology]
+      [handleExportToObj, buildingType]
     );
 
     const handleCaptureReady = useCallback(
@@ -1152,7 +1197,7 @@ export const ParcelScene = forwardRef<ParcelSceneHandle, ParcelSceneProps>(
             <SceneContent
               data={sceneData}
               modifiers={modifiers}
-              buildingTypology={buildingTypology}
+              buildingType={buildingType}
               sunTime={effectiveSunTime}
               mapZoom={mapZoom}
               onCaptureReady={handleCaptureReady}

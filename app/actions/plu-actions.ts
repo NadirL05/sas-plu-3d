@@ -25,7 +25,7 @@ const zoneLookupCache = new Map<
   { expiresAt: number; result: { zone: ZoneUrba | null; parcel: ParcelPolygon | null } }
 >();
 
-// ─── Lookup zone (GPU WFS, côté serveur pour éviter les CORS) ─────────────────
+// ─── Lookup zone (PostGIS local, côté serveur) ─────────────────
 
 export async function lookupZoneAction(
   lon: number,
@@ -48,7 +48,7 @@ export async function lookupZoneAction(
       err instanceof PLUEngineError &&
       (err.code === "TIMEOUT" || err.code === "WFS_FAILED")
     ) {
-      // Le service IGN est souvent intermittent : on garde la suite du flux avec zone=null.
+      // La zone n'est pas bloquante : on garde la suite du flux avec zone=null.
       console.warn("[lookupZoneAction][zone]", err.message);
       return null;
     }
