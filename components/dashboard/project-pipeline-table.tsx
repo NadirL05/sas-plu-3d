@@ -84,9 +84,9 @@ export function ProjectPipelineTable({ projectName, studies }: ProjectPipelineTa
         | { id?: string; status?: FeasibilityStatus; note?: string; error?: string; message?: string }
         | null;
 
-      if (!response.ok || !data || (data as any).error) {
+      if (!response.ok || !data || data.error) {
         const message =
-          (data as any)?.message ??
+          data?.message ??
           "Impossible de mettre à jour cette étude. Merci de réessayer plus tard.";
         setError(message);
         setSavingId(null);
@@ -98,7 +98,7 @@ export function ProjectPipelineTable({ projectName, studies }: ProjectPipelineTa
           rowItem.id === id
             ? {
                 ...rowItem,
-                status: (data.status as FeasibilityStatus) ?? rowItem.status,
+                status: data.status ?? rowItem.status,
                 note: data.note ?? rowItem.note,
               }
             : rowItem,

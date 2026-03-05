@@ -729,17 +729,11 @@ export async function getZoneUrba(
     return postgisResult;
   }
 
-  const params = new URLSearchParams({
-    SERVICE: "WFS",
-    VERSION: "2.0.0",
-    REQUEST: "GetFeature",
-    TYPENAMES: "GPU:zone_urba",
-    OUTPUTFORMAT: "application/json",
-    SRSNAME: "EPSG:4326",
-    COUNT: "1",
-    CQL_FILTER: `INTERSECTS(geom,POINT(${lon} ${lat}))`,
-  });
-  const wfsUrl = `${IGN_WFS_GPU_URL}?${params.toString()}`;
+  const cqlFilter = `INTERSECTS(the_geom,POINT(${lat} ${lon}))`;
+  const wfsUrl =
+    `${IGN_WFS_GPU_URL}?SERVICE=WFS&VERSION=2.0.0&REQUEST=GetFeature` +
+    `&TYPENAMES=wfs_du:zone_urba&OUTPUTFORMAT=application/json&SRSNAME=EPSG:4326` +
+    `&COUNT=1&CQL_FILTER=${encodeURIComponent(cqlFilter)}`;
 
   try {
     const res = await fetchIgnWithRetry(
@@ -928,11 +922,11 @@ export async function getDvfSummaryNearby(
       };
     }
 
-    const inseeCode = pickStringProperty(properties, ["code_insee", "insee", "INSEE"]);
+    const inseeCodeValue = pickStringProperty(properties, ["code_insee", "insee", "INSEE"]);
     const idu = pickStringProperty(properties, ["idu", "IDU"]);
-    const sectionCode = idu && idu.length >= 10 ? idu.slice(5, 10) : null;
+    const sectionCodeValue = idu && idu.length >= 10 ? idu.slice(5, 10) : null;
 
-    if (!inseeCode || !sectionCode) {
+    if (!inseeCodeValue || !sectionCodeValue) {
       return {
         inseeCode: "",
         sectionCode: "",
@@ -945,6 +939,9 @@ export async function getDvfSummaryNearby(
         dvfHistory: [],
       };
     }
+
+    const inseeCode = inseeCodeValue;
+    const sectionCode = sectionCodeValue;
 
     function parseDvfRows(payload: unknown): Array<Record<string, unknown>> {
       if (Array.isArray(payload)) {
@@ -1429,5 +1426,4 @@ export async function lookupPLU(address: string): Promise<PLUResult | null> {
 
   return { address: best, zone, parcel };
 }
-
 

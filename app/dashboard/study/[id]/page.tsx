@@ -138,6 +138,11 @@ export default async function StudyPage({ params }: StudyPageProps) {
     .where(eq(feasibilityScenario.feasibilityStudyId, study.id))
     .orderBy(desc(feasibilityScenario.createdAt));
 
+  const mappedScenarios = scenarios.map((scenario) => ({
+    ...scenario,
+    createdAt: scenario.createdAt ? scenario.createdAt.toISOString() : null,
+  }));
+
   const addressSuggestion: AddressSuggestion = {
     label: study.address,
     lon: Number(study.lon ?? 0),
@@ -445,7 +450,7 @@ export default async function StudyPage({ params }: StudyPageProps) {
         </Card>
       </section>
 
-      <StudyScenariosSection studyId={study.id} initialScenarios={scenarios} />
+      <StudyScenariosSection studyId={study.id} initialScenarios={mappedScenarios} />
     </main>
   );
 }

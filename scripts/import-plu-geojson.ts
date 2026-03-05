@@ -33,9 +33,16 @@ interface GeoJsonFeatureCollection {
 }
 
 function normalizeString(value: unknown): string | null {
-  if (typeof value !== "string") return null;
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : null;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  }
+
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(Math.trunc(value));
+  }
+
+  return null;
 }
 
 function buildWfsFallbackUrl(dept: string): string {
@@ -140,7 +147,37 @@ function pickStringProperty(properties: Record<string, unknown>, keys: string[])
   return null;
 }
 
-async function ensureSpatialSchema(sql: ReturnType<typeof neon>): Promise<void> {
+function extractCodeCommune(properties: Record<string, unknown>, dept: string): string | null {
+  const direct = pickStringProperty(properties, [
+    "insee",
+    "INSEE",
+    "code_insee",
+    "codeInsee",
+    "code_commune",
+    "CODE_COMMUNE",
+  ]);
+
+  if (direct && /^\d{5}$/.test(direct) && direct.startsWith(dept)) {
+    return direct;
+  }
+
+  const nomfic = pickStringProperty(properties, ["nomfic", "NOMFIC"]);
+  if (nomfic) {
+    const prefixed = nomfic.match(/^(\d{5})/);
+    if (prefixed && prefixed[1].startsWith(dept)) {
+      return prefixed[1];
+    }
+
+    const anywhere = nomfic.match(/\b(\d{5})\b/);
+    if (anywhere && anywhere[1].startsWith(dept)) {
+      return anywhere[1];
+    }
+  }
+
+  return null;
+}
+
+async function ensureSpatialSchema(sql: ReturnType<typeof neon<false, false>>): Promise<void> {
   await sql`CREATE EXTENSION IF NOT EXISTS postgis`;
 
   await sql`
@@ -215,26 +252,54 @@ async function main(): Promise<void> {
 
   let inserted = 0;
   let skipped = 0;
+  const reasons: Record<string, number> = {
+    missing_geometry: 0,
+    missing_properties: 0,
+    unsupported_geometry: 0,
+    missing_code_commune: 0,
+    wrong_department: 0,
+    insert_error: 0,
+  };
 
   for (const feature of features) {
-    if (!feature.geometry || !feature.properties) {
+    if (!feature.geometry) {
       skipped += 1;
+      reasons.missing_geometry += 1;
       continue;
     }
 
-    const codeCommune = pickStringProperty(feature.properties, [
-      "insee",
-      "code_insee",
-      "code_commune",
-      "INSEE",
+    if (!feature.properties) {
+      skipped += 1;
+      reasons.missing_properties += 1;
+      continue;
+    }
+
+    if (feature.geometry.type !== "Polygon" && feature.geometry.type !== "MultiPolygon") {
+      skipped += 1;
+      reasons.unsupported_geometry += 1;
+      continue;
+    }
+
+    const codeCommune = extractCodeCommune(feature.properties, DEPT);
+
+    if (!codeCommune) {
+      skipped += 1;
+      reasons.missing_code_commune += 1;
+      continue;
+    }
+
+    if (!codeCommune.startsWith(DEPT)) {
+      skipped += 1;
+      reasons.wrong_department += 1;
+      continue;
+    }
+
+    const libelle = pickStringProperty(feature.properties, [
+      "libelle",
+      "LIBELLE",
+      "zone",
+      "libelle_zone",
     ]);
-
-    if (!codeCommune || !codeCommune.startsWith(DEPT)) {
-      skipped += 1;
-      continue;
-    }
-
-    const libelle = pickStringProperty(feature.properties, ["libelle", "LIBELLE", "zone"]);
     const typezone = pickStringProperty(feature.properties, ["typezone", "TYPEZONE", "type_zone"]);
     const urlfic = pickStringProperty(feature.properties, ["urlfic", "URLFIC", "url_document"]);
 
@@ -252,16 +317,23 @@ async function main(): Promise<void> {
         )
       `;
       inserted += 1;
-    } catch {
+    } catch (error) {
       skipped += 1;
+      reasons.insert_error += 1;
+      if (reasons.insert_error <= 5) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn(`[import-plu-geojson] Insert error (sample ${reasons.insert_error}): ${message}`);
+      }
     }
   }
 
   console.log(`[import-plu-geojson] Import terminé. Département=${DEPT}`);
   console.log(`[import-plu-geojson] Inserted=${inserted} Skipped=${skipped}`);
+  console.log(`[import-plu-geojson] Skip reasons=${JSON.stringify(reasons)}`);
 }
 
 main().catch((error) => {
   console.error("[import-plu-geojson] Erreur fatale:", error);
   process.exit(1);
 });
+

@@ -3,6 +3,21 @@ import { auth, STRIPE_BILLING_ENABLED } from "@/src/lib/auth";
 
 export const runtime = "nodejs";
 
+type UpgradeSubscriptionInput = {
+  headers: Headers;
+  body: {
+    plan: string;
+    annual: boolean;
+    successUrl: string;
+    cancelUrl: string;
+    disableRedirect: boolean;
+  };
+};
+
+type UpgradeSubscriptionOutput = {
+  url?: string | null;
+};
+
 function getAppUrl(request: NextRequest) {
   return (
     process.env.NEXT_PUBLIC_APP_URL ??
@@ -47,15 +62,18 @@ export async function POST(request: NextRequest) {
   }
 
   try {
-    const upgradeSubscription = (auth.api as { upgradeSubscription?: typeof auth.api.upgradeSubscription })
-      .upgradeSubscription;
+    const maybeUpgrade = (auth.api as Record<string, unknown>).upgradeSubscription;
 
-    if (!upgradeSubscription) {
+    if (typeof maybeUpgrade !== "function") {
       return NextResponse.json(
         { error: "Endpoint upgradeSubscription indisponible (plugin Stripe non chargé)." },
         { status: 503 }
       );
     }
+
+    const upgradeSubscription = maybeUpgrade as (
+      input: UpgradeSubscriptionInput
+    ) => Promise<UpgradeSubscriptionOutput>;
 
     const result = await upgradeSubscription({
       headers: request.headers,
@@ -68,7 +86,7 @@ export async function POST(request: NextRequest) {
       },
     });
 
-    if ("url" in result && result.url) {
+    if (result?.url) {
       return NextResponse.json({ url: result.url });
     }
 
@@ -87,3 +105,4 @@ export async function POST(request: NextRequest) {
     );
   }
 }
+

@@ -33,13 +33,13 @@ export default function Home() {
       <section className="mx-auto flex w-full max-w-6xl flex-col px-6 py-20 md:py-28">
         <div className="mx-auto max-w-3xl text-center">
           <p className="text-sm font-medium uppercase tracking-[0.2em] text-muted-foreground">
-            SaaS d'analyse foncière
+            SaaS d&apos;analyse foncière
           </p>
           <h1 className="mt-4 text-4xl font-bold tracking-tight text-balance md:text-5xl">
             Analysez le potentiel 3D de vos terrains en 1 clic
           </h1>
           <p className="mt-5 text-lg text-muted-foreground">
-            Accélérez vos études foncières avec une lecture réglementaire automatique, une modélisation 3D précise et des livrables prêts à l'emploi.
+            Accélérez vos études foncières avec une lecture réglementaire automatique, une modélisation 3D précise et des livrables prêts à l&apos;emploi.
           </p>
         </div>
 
@@ -64,10 +64,11 @@ export default function Home() {
             size="lg"
             className="h-12 rounded-md px-10 text-base font-semibold shadow-lg shadow-primary/20"
           >
-            <Link href="/dashboard">Démarrer l'analyse gratuite</Link>
+            <Link href="/dashboard">Démarrer l&apos;analyse gratuite</Link>
           </Button>
         </div>
       </section>
     </main>
   )
 }
+

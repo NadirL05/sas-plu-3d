@@ -1,5 +1,5 @@
 import { headers } from "next/headers";
-import { redirect } from "next/navigation";
+import { notFound, redirect } from "next/navigation";
 import { desc, eq } from "drizzle-orm";
 import { auth } from "@/src/lib/auth";
 import { db } from "@/src/db";
@@ -15,6 +15,10 @@ export default async function DashboardPage() {
     session = await auth.api.getSession({ headers: await headers() });
   } catch {
     // ignore, handled below
+  }
+
+  if (!db) {
+    notFound();
   }
 
   const userId = session?.user?.id;
@@ -43,3 +47,4 @@ export default async function DashboardPage() {
     </div>
   );
 }
+

@@ -15,6 +15,20 @@ type BillingPageProps = {
   searchParams?: Promise<Record<string, string | string[] | undefined>>;
 };
 
+type ActiveSubscription = {
+  plan?: string | null;
+  status?: string | null;
+  periodStart?: Date | string | null;
+  periodEnd?: Date | string | null;
+};
+
+function toDateLabel(value: Date | string | null | undefined): string {
+  if (!value) return "-";
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return "-";
+  return date.toLocaleDateString("fr-FR");
+}
+
 export default async function BillingPage({ searchParams }: BillingPageProps) {
   const resolvedSearchParams = (await searchParams) ?? {};
   const checkoutState = Array.isArray(resolvedSearchParams.checkout)
@@ -44,11 +58,16 @@ export default async function BillingPage({ searchParams }: BillingPageProps) {
     );
   }
 
-  let activeSubscriptions: Awaited<ReturnType<typeof auth.api.listActiveSubscriptions>> = [];
+  let activeSubscriptions: ActiveSubscription[] = [];
   try {
-    activeSubscriptions = await auth.api.listActiveSubscriptions({
-      headers: await headers(),
-    });
+    const maybeList = (auth.api as Record<string, unknown>).listActiveSubscriptions;
+    if (typeof maybeList === "function") {
+      const listActiveSubscriptions = maybeList as (input: { headers: Headers }) => Promise<unknown>;
+      const result = await listActiveSubscriptions({ headers: await headers() });
+      if (Array.isArray(result)) {
+        activeSubscriptions = result as ActiveSubscription[];
+      }
+    }
   } catch (error) {
     console.warn("[billing.page] subscriptions fallback []", error);
   }
@@ -115,8 +134,7 @@ export default async function BillingPage({ searchParams }: BillingPageProps) {
           <p>
             Période:{" "}
             <span className="font-medium">
-              {mainSubscription?.periodStart?.toLocaleDateString("fr-FR") ?? "-"} {"->"}{" "}
-              {mainSubscription?.periodEnd?.toLocaleDateString("fr-FR") ?? "-"}
+              {toDateLabel(mainSubscription?.periodStart)} {"->"} {toDateLabel(mainSubscription?.periodEnd)}
             </span>
           </p>
         </div>
@@ -139,3 +157,4 @@ export default async function BillingPage({ searchParams }: BillingPageProps) {
     </div>
   );
 }
+

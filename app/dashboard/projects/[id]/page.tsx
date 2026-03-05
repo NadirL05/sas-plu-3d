@@ -16,6 +16,10 @@ export const metadata = {
 };
 
 export default async function ProjectPipelinePage({ params }: ProjectPageProps) {
+  if (!db) {
+    notFound();
+  }
+
   const projectId = params.id;
 
   let session: Awaited<ReturnType<typeof auth.api.getSession>> | null = null;

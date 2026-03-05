@@ -82,7 +82,7 @@ async function discoverGeoJsonUrlFromDataGouv(): Promise<string> {
   throw new Error("Aucune ressource GeoJSON département 13 trouvée via Data.gouv API.");
 }
 
-async function ensureSchema(sql: ReturnType<typeof neon>): Promise<void> {
+async function ensureSchema(sql: ReturnType<typeof neon<false, false>>): Promise<void> {
   await sql`CREATE EXTENSION IF NOT EXISTS postgis`;
 
   await sql`
@@ -201,3 +201,4 @@ main().catch((error) => {
   console.error("[import-plu-13] Erreur fatale:", error);
   process.exit(1);
 });
+

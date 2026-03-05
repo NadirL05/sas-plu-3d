@@ -1,7 +1,7 @@
 import type { Config } from "tailwindcss"
 
 const config: Config = {
-  darkMode: ["class"],
+  darkMode: "class",
   theme: {
     extend: {
       colors: {
@@ -17,3 +17,4 @@ const config: Config = {
 }
 
 export default config
+

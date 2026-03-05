@@ -75,15 +75,16 @@ export async function POST(
     }),
   ]);
 
-  const currentZoning = (study.zoning ?? null) as Record<string, unknown> | null;
+  const currentZoning = study.zoning ?? null;
 
   await db
     .update(feasibilityStudy)
     .set({
-      zoning: (zone ?? currentZoning ?? null) as Record<string, unknown> | null,
+      zoning: zone ?? currentZoning,
       parcel: parcel ?? null,
     })
     .where(and(eq(feasibilityStudy.id, studyId), eq(feasibilityStudy.userId, userId)));
 
   return NextResponse.json({ zoning: zone, parcel }, { status: 200 });
 }
+

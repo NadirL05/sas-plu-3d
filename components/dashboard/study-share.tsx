@@ -45,9 +45,9 @@ export function StudyShare({ studyId, initialEnabled, initialPublicShareId }: St
           }
         | null;
 
-      if (!response.ok || !data || (data as any).error) {
+      if (!response.ok || !data || data.error) {
         const message =
-          (data as any)?.message ??
+          data?.message ??
           "Impossible de mettre à jour les paramètres de partage. Merci de réessayer plus tard.";
         setError(message);
         setIsSaving(false);
