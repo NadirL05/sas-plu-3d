@@ -23,6 +23,8 @@ import { StudyScenariosSection } from "@/components/dashboard/study-scenarios";
 import { StudyShare } from "@/components/dashboard/study-share";
 import { StudyParcelView } from "@/components/dashboard/study-parcel-view";
 import { ReanalyzeButton } from "@/components/dashboard/reanalyze-button";
+import { StudyFinancialPanel } from "@/components/dashboard/study-financial-panel";
+import { StudyExportButton } from "@/components/dashboard/study-export-button";
 
 function formatCurrency(value?: number | null): string {
   if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return "-";
@@ -111,8 +113,9 @@ export default async function StudyPage({ params }: StudyPageProps) {
     notFound();
   }
 
-  if (row.projectUserId && row.projectUserId !== userId) {
-    // Étude appartenant à un autre utilisateur
+  // Vérifie l'ownership : via le projet (si lié) ou directement via study.userId
+  const ownerId = row.projectUserId ?? row.study.userId;
+  if (ownerId !== userId) {
     notFound();
   }
 
@@ -158,16 +161,39 @@ export default async function StudyPage({ params }: StudyPageProps) {
 
   return (
     <main className="mx-auto flex max-w-5xl flex-col gap-5 px-4 py-6 md:py-8">
-      <header className="space-y-1">
-        <p className="text-[11px] font-semibold uppercase tracking-[0.2em] text-slate-500">
-          Étude de faisabilité
-        </p>
-        <h1 className="text-2xl font-semibold tracking-tight text-slate-50 md:text-3xl">
-          {projectName}
-        </h1>
-        <p className="text-xs text-slate-500">
-          ID étude : <span className="font-mono text-slate-300">{study.id}</span>
-        </p>
+      <header className="flex flex-wrap items-start justify-between gap-4">
+        <div className="space-y-1">
+          <p className="text-[11px] font-semibold uppercase tracking-[0.2em] text-slate-500">
+            Étude de faisabilité
+          </p>
+          <h1 className="text-2xl font-semibold tracking-tight text-slate-50 md:text-3xl">
+            {projectName}
+          </h1>
+          <p className="text-xs text-slate-500">
+            ID étude : <span className="font-mono text-slate-300">{study.id}</span>
+          </p>
+        </div>
+
+        <StudyExportButton
+          studyId={study.id}
+          address={study.address}
+          parcelAreaM2={parcel?.areaM2 ?? null}
+          parcelIdu={parcel?.idu ?? null}
+          zoningType={zoning?.typezone ?? null}
+          zoningLibelle={zoning?.libelle ?? null}
+          maxHeightM={scenarios[0]?.maxHeightM ?? null}
+          dvfMedianValueEur={dvf?.medianValueEur ?? null}
+          dvfMedianPricePerM2Eur={dvf?.medianPricePerM2Eur ?? null}
+          dvfMutationCount={dvf?.mutationCount ?? null}
+          floodLevel={risks?.floodLevel ?? null}
+          clayLevel={risks?.clayLevel ?? null}
+          hazardCount={risks?.hazardCount ?? null}
+          promoterSurfacePlancherM2={promoter?.surfacePlancherM2 ?? null}
+          promoterCaEur={promoter?.chiffreAffairesEstimeEur ?? null}
+          promoterCoutConstructionEur={promoter?.coutConstructionEur ?? null}
+          promoterFraisAnnexesEur={promoter?.fraisAnnexesEur ?? null}
+          promoterPrixMaxTerrainEur={promoter?.prixMaxTerrainEur ?? null}
+        />
       </header>
 
       <StudyShare
@@ -449,6 +475,12 @@ export default async function StudyPage({ params }: StudyPageProps) {
           </CardContent>
         </Card>
       </section>
+
+      <StudyFinancialPanel
+        parcelAreaM2={parcel?.areaM2 ?? null}
+        zoningType={zoning?.typezone ?? null}
+        maxHeightM={scenarios[0]?.maxHeightM ?? null}
+      />
 
       <StudyScenariosSection studyId={study.id} initialScenarios={mappedScenarios} />
     </main>

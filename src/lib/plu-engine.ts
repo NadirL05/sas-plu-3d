@@ -729,7 +729,7 @@ export async function getZoneUrba(
     return postgisResult;
   }
 
-  const cqlFilter = `INTERSECTS(the_geom,POINT(${lat} ${lon}))`;
+  const cqlFilter = `INTERSECTS(the_geom,POINT(${lon} ${lat}))`;
   const wfsUrl =
     `${IGN_WFS_GPU_URL}?SERVICE=WFS&VERSION=2.0.0&REQUEST=GetFeature` +
     `&TYPENAMES=wfs_du:zone_urba&OUTPUTFORMAT=application/json&SRSNAME=EPSG:4326` +
@@ -988,7 +988,7 @@ export async function getDvfSummaryNearby(
       const cquestUrl =
         scope === "section"
           ? `${DVF_API_BASE_URL}?section=${encodeURIComponent(
-              `${inseeCode}000${sectionCode}`
+              `${inseeCode}${sectionCode}`
             )}`
           : `${DVF_API_BASE_URL}?code_commune=${encodeURIComponent(inseeCode)}`;
 

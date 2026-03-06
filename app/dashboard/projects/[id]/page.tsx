@@ -8,7 +8,7 @@ import type { ZoneUrba, PromoterBalance } from "@/src/lib/plu-engine";
 import { ProjectPipelineTable } from "@/components/dashboard/project-pipeline-table";
 
 type ProjectPageProps = {
-  params: { id: string };
+  params: Promise<{ id: string }>;
 };
 
 export const metadata = {
@@ -20,7 +20,7 @@ export default async function ProjectPipelinePage({ params }: ProjectPageProps) 
     notFound();
   }
 
-  const projectId = params.id;
+  const { id: projectId } = await params;
 
   let session: Awaited<ReturnType<typeof auth.api.getSession>> | null = null;
   try {

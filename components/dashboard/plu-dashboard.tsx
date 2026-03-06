@@ -4,11 +4,14 @@ import { useState, useCallback, useEffect, useRef } from "react";
 import dynamic from "next/dynamic";
 import {
   AlertCircle,
+  AlertTriangle,
   BarChart3,
   Box,
   Building2,
+  Calculator,
   CheckCircle,
   CircleAlert,
+  Euro,
   ExternalLink,
   FileDown,
   Grid3X3,
@@ -16,12 +19,14 @@ import {
   Loader2,
   MapPin,
   Minus,
+  Palette,
   Plus,
   Save,
   Satellite,
   Search,
   ShieldCheck,
   Sparkles,
+  Trees,
   TrendingUp,
   Waves,
 } from "lucide-react";
@@ -48,6 +53,7 @@ import type {
 import type {
   ParcelSceneData,
   ParcelSceneHandle,
+  StudioTree,
 } from "@/components/three/ParcelScene";
 
 declare global {
@@ -269,9 +275,11 @@ function getBuildabilityLabel(height: number | null): string {
 
 interface PLUDashboardProps {
   isAuthenticated?: boolean;
+  /** Accès au Studio PRO (façade, textures, arbres manuels). */
+  isPro?: boolean;
 }
 
-export function PLUDashboard({ isAuthenticated = false }: PLUDashboardProps) {
+export function PLUDashboard({ isAuthenticated = false, isPro = false }: PLUDashboardProps) {
   const [query, setQuery] = useState("");
   const [suggestions, setSuggestions] = useState<AddressSuggestion[]>([]);
   const [showDropdown, setShowDropdown] = useState(false);
@@ -340,6 +348,29 @@ export function PLUDashboard({ isAuthenticated = false }: PLUDashboardProps) {
     espacesVerts: string;
   } | null>(null);
   const activePluPdfUrl = uploadedPluPdfUrl ?? zone?.urlfic ?? null;
+
+  // ── Bilan Financier Promoteur ────────────────────────────────────────────────
+  const [landPriceEur, setLandPriceEur] = useState<string>("");
+  const [constructionCostPerM2, setConstructionCostPerM2] = useState<string>("1800");
+  const [salePricePerM2, setSalePricePerM2] = useState<string>("4500");
+
+  // ── Studio PRO ──────────────────────────────────────────────────────────────
+  const [facadeColor, setFacadeColor] = useState("#f8fafc");
+  const [facadeTexture, setFacadeTexture] = useState<"enduit" | "brique" | "bois">("enduit");
+  const [studioTrees, setStudioTrees] = useState<StudioTree[]>([]);
+
+  const handleAddStudioTree = useCallback(() => {
+    const angle = Math.random() * Math.PI * 2;
+    const dist = 8 + Math.random() * 6;
+    setStudioTrees((prev) => [
+      ...prev,
+      {
+        id: `tree-${Date.now()}`,
+        dx: Math.cos(angle) * dist,
+        dz: Math.sin(angle) * dist,
+      },
+    ]);
+  }, []);
 
   const handleExportObj = useCallback(() => {
     if (!parcelSceneRef.current) return;
@@ -936,6 +967,37 @@ export function PLUDashboard({ isAuthenticated = false }: PLUDashboardProps) {
     medianSalePricePerM2Eur: dvfSummary?.medianPricePerM2Eur ?? null,
   });
   const promoterBalance = profitability;
+
+  // ── Bilan Financier en temps réel ────────────────────────────────────────────
+  // Emprise au sol selon le type de bâtiment choisi dans la scène 3D
+  const financialCoverageRatio =
+    buildingType === "collective" ? 0.6
+    : buildingType === "house"   ? 0.4
+    : buildingType === "mixed"   ? 0.5
+    : 0.7; // massing
+  // Nombre d'étages déduit de la hauteur PLU (1 niveau ≈ 3 m, min 1)
+  const financialFloors = maxHeight ? Math.max(1, Math.floor(maxHeight / 3)) : null;
+  // Surface de plancher estimée (emprise × étages)
+  const financialSdpM2 =
+    parcel?.areaM2 && financialFloors
+      ? Math.round(parcel.areaM2 * financialCoverageRatio * financialFloors)
+      : null;
+  const financialLandPrice   = parseFloat(landPriceEur.replace(/\s/g, "")) || 0;
+  const financialConstructCost = parseFloat(constructionCostPerM2) || 1800;
+  const financialSalePrice   = parseFloat(salePricePerM2)          || 4500;
+  const financialCA          = financialSdpM2 ? financialSdpM2 * financialSalePrice : null;
+  const financialCoutTotal   = financialSdpM2
+    ? financialLandPrice + financialSdpM2 * financialConstructCost
+    : null;
+  // Marge nette = (CA - coûts totaux) / CA
+  const financialMargeNette  =
+    financialCA && financialCA > 0 && financialCoutTotal !== null
+      ? (financialCA - financialCoutTotal) / financialCA
+      : null;
+  // Seuil de risque : marge < 15 %
+  const financialIsRisky     =
+    financialMargeNette !== null && financialMargeNette < 0.15;
+
   const floodRiskVisual = getRiskVisual(georisquesSummary?.floodLevel ?? "UNKNOWN");
   const clayRiskVisual = getRiskVisual(georisquesSummary?.clayLevel ?? "UNKNOWN");
   const riskRank: Record<RiskLevel, number> = { UNKNOWN: 0, LOW: 1, MEDIUM: 2, HIGH: 3 };
@@ -1216,6 +1278,9 @@ export function PLUDashboard({ isAuthenticated = false }: PLUDashboardProps) {
                 hidePromptInput
                 onPromptChange={setScenePrompt}
                 onCaptureReady={(capture) => setCaptureScene(() => capture)}
+                facadeColor={isPro ? facadeColor : undefined}
+                facadeTexture={isPro ? facadeTexture : undefined}
+                studioTrees={isPro ? studioTrees : undefined}
               />
               <div className="absolute bottom-6 right-6 z-40 premium-glass rounded-xl p-4 flex flex-col gap-3 w-64 shadow-2xl">
                 <div className="flex justify-between items-center">
@@ -1755,6 +1820,151 @@ export function PLUDashboard({ isAuthenticated = false }: PLUDashboardProps) {
 
       {selectedAddress ? (
         <aside className="pointer-events-none fixed right-4 top-28 z-40 hidden 2xl:flex w-[320px] flex-col gap-4 bg-[#101022]/40 backdrop-blur-3xl border-l border-white/5 rounded-l-2xl pl-4 pr-4 py-4">
+
+          {/* ── Bilan Financier Promoteur (paramétrable) ── */}
+          <div className="pointer-events-auto premium-glass rounded-3xl p-6">
+            {/* Header */}
+            <div className="mb-5 flex items-center gap-2">
+              <Calculator className="h-3.5 w-3.5 text-slate-500" />
+              <p className="text-[10px] uppercase tracking-[0.2em] font-bold text-slate-500">
+                Bilan Promoteur
+              </p>
+            </div>
+
+            {/* ── Inputs ── */}
+            <div className="space-y-3 mb-5">
+              {/* Prix terrain */}
+              <div className="space-y-1">
+                <label className="text-[10px] font-semibold uppercase tracking-[0.15em] text-slate-500">
+                  Prix d&apos;achat terrain (€)
+                </label>
+                <div className="relative">
+                  <span className="pointer-events-none absolute inset-y-0 left-3 flex items-center">
+                    <Euro className="h-3.5 w-3.5 text-slate-500" />
+                  </span>
+                  <input
+                    type="number"
+                    min={0}
+                    step={10000}
+                    placeholder="350 000"
+                    value={landPriceEur}
+                    onChange={(e) => setLandPriceEur(e.target.value)}
+                    className="w-full rounded-xl border border-white/10 bg-white/[0.04] py-2 pl-8 pr-3 text-xs font-semibold text-white placeholder:text-slate-600 focus:border-primary/50 focus:outline-none focus:ring-1 focus:ring-primary/30 transition-all"
+                  />
+                </div>
+              </div>
+
+              {/* Coût de construction */}
+              <div className="space-y-1">
+                <label className="text-[10px] font-semibold uppercase tracking-[0.15em] text-slate-500">
+                  Coût construction (€/m²)
+                </label>
+                <div className="relative">
+                  <span className="pointer-events-none absolute inset-y-0 left-3 flex items-center">
+                    <Building2 className="h-3.5 w-3.5 text-slate-500" />
+                  </span>
+                  <input
+                    type="number"
+                    min={0}
+                    step={100}
+                    value={constructionCostPerM2}
+                    onChange={(e) => setConstructionCostPerM2(e.target.value)}
+                    className="w-full rounded-xl border border-white/10 bg-white/[0.04] py-2 pl-8 pr-3 text-xs font-semibold text-white placeholder:text-slate-600 focus:border-primary/50 focus:outline-none focus:ring-1 focus:ring-primary/30 transition-all"
+                  />
+                </div>
+              </div>
+
+              {/* Prix de vente */}
+              <div className="space-y-1">
+                <label className="text-[10px] font-semibold uppercase tracking-[0.15em] text-slate-500">
+                  Prix de vente (€/m²)
+                </label>
+                <div className="relative">
+                  <span className="pointer-events-none absolute inset-y-0 left-3 flex items-center">
+                    <TrendingUp className="h-3.5 w-3.5 text-slate-500" />
+                  </span>
+                  <input
+                    type="number"
+                    min={0}
+                    step={100}
+                    value={salePricePerM2}
+                    onChange={(e) => setSalePricePerM2(e.target.value)}
+                    className="w-full rounded-xl border border-white/10 bg-white/[0.04] py-2 pl-8 pr-3 text-xs font-semibold text-white placeholder:text-slate-600 focus:border-primary/50 focus:outline-none focus:ring-1 focus:ring-primary/30 transition-all"
+                  />
+                </div>
+              </div>
+            </div>
+
+            {/* ── Résultats ── */}
+            {financialSdpM2 ? (
+              <div className="space-y-2.5">
+                {/* SDP */}
+                <div className="rounded-xl bg-white/[0.03] border border-white/[0.06] px-3 py-2.5">
+                  <div className="flex items-center justify-between text-[11px]">
+                    <span className="text-slate-400">Surface de plancher (SDP)</span>
+                    <span className="font-black text-white">
+                      {financialSdpM2.toLocaleString("fr-FR")}&nbsp;m²
+                    </span>
+                  </div>
+                  <p className="mt-0.5 text-[10px] text-slate-600">
+                    {financialFloors}&nbsp;étage{financialFloors !== 1 ? "s" : ""}
+                    &nbsp;·&nbsp;{Math.round(financialCoverageRatio * 100)}%&nbsp;emprise
+                    &nbsp;·&nbsp;{buildingType}
+                  </p>
+                </div>
+
+                {/* CA + Coût total */}
+                <div className="rounded-xl bg-white/[0.03] border border-white/[0.06] px-3 py-2.5 space-y-2">
+                  <div className="flex items-center justify-between text-[11px]">
+                    <span className="text-slate-400">Chiffre d&apos;affaires</span>
+                    <span className="font-black text-white">{formatCurrency(financialCA)}</span>
+                  </div>
+                  <div className="flex items-center justify-between text-[11px]">
+                    <span className="text-slate-400">Coût total</span>
+                    <span className="font-black text-white">{formatCurrency(financialCoutTotal)}</span>
+                  </div>
+                </div>
+
+                {/* Marge nette — conditionnellement verte ou rouge */}
+                {financialMargeNette !== null ? (
+                  financialIsRisky ? (
+                    <div className="rounded-xl border border-red-500/40 bg-red-500/10 px-4 py-4 shadow-[0_0_28px_rgba(239,68,68,0.22)]">
+                      <div className="mb-2 flex items-center gap-2">
+                        <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-red-400" />
+                        <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-red-400">
+                          Projet risqué
+                        </p>
+                      </div>
+                      <p className="text-3xl font-black tracking-tight text-red-400">
+                        {(financialMargeNette * 100).toFixed(1)}%
+                      </p>
+                      <p className="mt-1 text-[10px] text-red-300/60">
+                        Marge nette inférieure au seuil de 15 %
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="rounded-xl border border-emerald-500/40 bg-emerald-500/10 px-4 py-4 shadow-[0_0_28px_rgba(16,185,129,0.25)]">
+                      <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-emerald-400">
+                        Marge nette
+                      </p>
+                      <p className="mt-2 text-3xl font-black tracking-tight text-emerald-400">
+                        +{(financialMargeNette * 100).toFixed(1)}%
+                      </p>
+                      <p className="mt-1 text-[10px] text-emerald-300/60">
+                        Opération viable ✓
+                      </p>
+                    </div>
+                  )
+                ) : null}
+              </div>
+            ) : (
+              <p className="text-xs text-slate-500">
+                Sélectionnez une parcelle pour estimer la SDP et calculer la rentabilité en temps réel.
+              </p>
+            )}
+          </div>
+
+          {/* ── Bilan Promoteur IA (DVF auto) ── */}
           <div className="pointer-events-auto premium-glass rounded-3xl p-6">
             <div className="mb-4 flex items-center justify-between gap-2">
               <p className="text-[10px] uppercase tracking-[0.2em] font-bold text-slate-500 flex items-center gap-2">
@@ -1901,6 +2111,100 @@ export function PLUDashboard({ isAuthenticated = false }: PLUDashboardProps) {
             ) : (
               <p className="text-xs text-slate-500">
                 Données risques indisponibles pour cette parcelle.
+              </p>
+            )}
+          </div>
+
+          {/* ── Studio PRO ── visible uniquement pour les abonnés PRO ── */}
+          <div className="pointer-events-auto premium-glass rounded-3xl p-6">
+            <div className="mb-4 flex items-center justify-between gap-2">
+              <p className="text-[10px] uppercase tracking-[0.2em] font-bold text-slate-500 flex items-center gap-2">
+                <Palette className="h-3.5 w-3.5 text-slate-500" />
+                Studio PRO
+              </p>
+              {!isPro && (
+                <span className="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[10px] font-semibold text-amber-400">
+                  PRO requis
+                </span>
+              )}
+            </div>
+
+            {isPro ? (
+              <div className="space-y-4">
+                {/* Couleur de façade */}
+                <div className="space-y-1.5">
+                  <p className="text-[11px] font-semibold text-slate-400">Couleur façade</p>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="color"
+                      value={facadeColor}
+                      onChange={(e) => {
+                        setFacadeColor(e.target.value);
+                        setFacadeTexture("enduit");
+                      }}
+                      className="h-8 w-10 cursor-pointer rounded-md border border-white/10 bg-transparent"
+                      aria-label="Couleur de façade"
+                    />
+                    <span className="font-mono text-[11px] text-slate-400">{facadeColor}</span>
+                  </div>
+                </div>
+
+                {/* Texture de façade */}
+                <div className="space-y-1.5">
+                  <p className="text-[11px] font-semibold text-slate-400">Texture façade</p>
+                  <div className="flex gap-1.5">
+                    {(["enduit", "brique", "bois"] as const).map((t) => (
+                      <button
+                        key={t}
+                        type="button"
+                        onClick={() => {
+                          setFacadeTexture(t);
+                          setFacadeColor(
+                            t === "enduit" ? "#f8fafc" : t === "brique" ? "#c2714f" : "#8b6f47"
+                          );
+                        }}
+                        className={`flex-1 rounded-lg border py-1.5 text-[11px] font-medium capitalize transition-all ${
+                          facadeTexture === t
+                            ? "border-primary/40 bg-primary/10 text-primary"
+                            : "border-white/10 bg-white/[0.04] text-slate-300 hover:bg-white/[0.08]"
+                        }`}
+                      >
+                        {t}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Arbres */}
+                <div className="space-y-1.5">
+                  <p className="text-[11px] font-semibold text-slate-400">
+                    Végétation ({studioTrees.length} arbre{studioTrees.length !== 1 ? "s" : ""})
+                  </p>
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={handleAddStudioTree}
+                      className="flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-emerald-500/30 bg-emerald-500/10 py-2 text-[11px] font-semibold text-emerald-400 transition-colors hover:bg-emerald-500/20"
+                    >
+                      <Trees className="h-3.5 w-3.5" />
+                      Ajouter un arbre
+                    </button>
+                    {studioTrees.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => setStudioTrees([])}
+                        className="rounded-lg border border-white/10 bg-white/[0.04] px-3 py-2 text-[11px] font-medium text-slate-400 transition-colors hover:bg-white/[0.08]"
+                        aria-label="Effacer tous les arbres"
+                      >
+                        Tout effacer
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <p className="text-xs text-slate-500">
+                Débloquez le Studio PRO pour personnaliser la façade et ajouter des éléments à votre maquette 3D.
               </p>
             )}
           </div>

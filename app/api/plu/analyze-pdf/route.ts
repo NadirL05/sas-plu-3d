@@ -4,8 +4,6 @@ import OpenAI from "openai";
 import { db } from "@/src/db";
 import { pluAiCache } from "@/src/db/schema";
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
 interface AnalyzePdfPayload {
   urlfic?: string;
 }
@@ -87,9 +85,13 @@ async function saveAnalysisToCache(urlfic: string, analysis: PluAnalysisResult):
 }
 
 export async function POST(req: Request) {
-  if (!process.env.OPENAI_API_KEY) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) {
     return NextResponse.json({ error: "OPENAI_API_KEY non configurée." }, { status: 500 });
   }
+
+  // Instantiated here (not at module scope) so the build phase never throws
+  const openai = new OpenAI({ apiKey });
 
   let body: AnalyzePdfPayload;
   try {

@@ -14,6 +14,8 @@ import {
   ContactShadows,
   Environment,
   Grid,
+  Html,
+  Line,
   OrbitControls,
 } from "@react-three/drei";
 import { gsap } from "gsap";
@@ -23,6 +25,7 @@ import { OBJExporter } from "three-stdlib";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
 import { getParcelPolygon, type ParcelGeometry } from "@/src/lib/plu-engine";
+import type { NearbyBuilding } from "@/src/lib/osm-engine";
 
 // ─── Données pour la visualisation 3D ─────────────────────────────────────────
 
@@ -402,11 +405,27 @@ function scaleShapes(shapes: THREE.Shape[], scale: number): THREE.Shape[] {
   });
 }
 
+type FacadeTexture = "enduit" | "brique" | "bois";
+
+const TEXTURE_COLOR: Record<FacadeTexture, string> = {
+  enduit: "#f8fafc",
+  brique: "#c2714f",
+  bois: "#8b6f47",
+};
+
+const TEXTURE_ROUGHNESS: Record<FacadeTexture, number> = {
+  enduit: 0.92,
+  brique: 0.85,
+  bois: 0.78,
+};
+
 interface BuildingPreviewProps {
   maxHeight: number;
   footprintShape: ParcelShapeData;
   buildingType?: BuildingType;
   buildingGroupRef?: React.RefObject<THREE.Group | null>;
+  facadeColor?: string;
+  facadeTexture?: FacadeTexture;
 }
 
 function BuildingPreview({
@@ -414,6 +433,8 @@ function BuildingPreview({
   footprintShape,
   buildingType = "collective",
   buildingGroupRef,
+  facadeColor,
+  facadeTexture = "enduit",
 }: BuildingPreviewProps) {
   const FLOOR_HEIGHT = 3;
   const WALL_HEIGHT = FLOOR_HEIGHT - 0.2;
@@ -516,8 +537,8 @@ function BuildingPreview({
                     />
                   ) : (
                     <meshStandardMaterial
-                      color="#f8fafc"
-                      roughness={0.92}
+                      color={facadeColor ?? TEXTURE_COLOR[facadeTexture]}
+                      roughness={TEXTURE_ROUGHNESS[facadeTexture]}
                       metalness={0.03}
                     />
                   )}
@@ -841,6 +862,223 @@ function ParcelTrees({ shape }: { shape: ParcelShapeData }) {
   );
 }
 
+// ─── Annotations HTML 3D ────────────────────────────────────────────────────────
+
+const BADGE_STYLE_BASE: React.CSSProperties = {
+  borderRadius: 6,
+  padding: "3px 8px",
+  fontSize: 11,
+  fontWeight: 600,
+  fontFamily: "monospace",
+  whiteSpace: "nowrap",
+  backdropFilter: "blur(4px)",
+  pointerEvents: "none",
+};
+
+function BuildingAnnotations({
+  data,
+  footprintShape,
+  buildingType,
+}: {
+  data: ParcelSceneData;
+  footprintShape: ParcelShapeData;
+  buildingType: BuildingType;
+}) {
+  const cx = footprintShape.center.x;
+  const cz = footprintShape.center.z;
+  const hw = footprintShape.width / 2;
+  const maxH = Math.max(0.2, data.maxHeight);
+  const sideX = cx + hw + 1.4;
+
+  return (
+    <>
+      {/* Ligne de mesure verticale pointillée */}
+      <Line
+        points={[[sideX, 0, cz], [sideX, maxH, cz]]}
+        color="#10b981"
+        lineWidth={1.5}
+        dashed
+        dashSize={0.4}
+        gapSize={0.2}
+      />
+      {/* Tirets horizontaux haut/bas */}
+      <Line
+        points={[[sideX - 0.3, 0, cz], [sideX + 0.3, 0, cz]]}
+        color="#10b981"
+        lineWidth={1.5}
+      />
+      <Line
+        points={[[sideX - 0.3, maxH, cz], [sideX + 0.3, maxH, cz]]}
+        color="#10b981"
+        lineWidth={1.5}
+      />
+
+      {/* Badge hauteur (vert = conforme PLU) */}
+      <Html
+        position={[sideX + 0.6, maxH / 2, cz]}
+        distanceFactor={20}
+        zIndexRange={[10, 0]}
+        style={{ pointerEvents: "none" }}
+      >
+        <div
+          style={{
+            ...BADGE_STYLE_BASE,
+            background: "rgba(16, 185, 129, 0.15)",
+            border: "1px solid #10b981",
+            color: "#10b981",
+          }}
+        >
+          Hauteur : {data.maxHeight}m
+        </div>
+      </Html>
+
+      {/* Badge zone PLU */}
+      {data.zoneType ? (
+        <Html
+          position={[cx, maxH + 2.0, cz]}
+          distanceFactor={20}
+          center
+          zIndexRange={[10, 0]}
+          style={{ pointerEvents: "none" }}
+        >
+          <div
+            style={{
+              ...BADGE_STYLE_BASE,
+              background: "rgba(59, 130, 246, 0.15)",
+              border: "1px solid #3b82f6",
+              color: "#93c5fd",
+            }}
+          >
+            Zone {data.zoneType}
+          </div>
+        </Html>
+      ) : null}
+
+      {/* Badge RDC Commercial (bâtiment mixte) */}
+      {buildingType === "mixed" ? (
+        <Html
+          position={[sideX + 0.6, 1.5, cz]}
+          distanceFactor={20}
+          zIndexRange={[10, 0]}
+          style={{ pointerEvents: "none" }}
+        >
+          <div
+            style={{
+              ...BADGE_STYLE_BASE,
+              background: "rgba(245, 158, 11, 0.15)",
+              border: "1px solid #f59e0b",
+              color: "#fcd34d",
+            }}
+          >
+            RDC Commercial
+          </div>
+        </Html>
+      ) : null}
+    </>
+  );
+}
+
+export interface StudioTree {
+  id: string;
+  /** Offset en mètres depuis le centre de la parcelle (axe X). */
+  dx: number;
+  /** Offset en mètres depuis le centre de la parcelle (axe Z). */
+  dz: number;
+}
+
+// ─── Bâtiments voisins (contexte urbain OSM) ────────────────────────────────
+
+/**
+ * Projette un anneau lon/lat en coordonnées de scène (mètres locaux)
+ * en utilisant le centre de la parcelle comme origine.
+ */
+function projectRingToScene(
+  ring: [number, number][],
+  originLon: number,
+  originLat: number
+): THREE.Vector2[] {
+  const cosLat = Math.cos(originLat * DEG_TO_RAD);
+  return ring.map(
+    ([lon, lat]) =>
+      new THREE.Vector2(
+        (lon - originLon) * DEG_TO_RAD * EARTH_RADIUS_M * cosLat,
+        (lat - originLat) * DEG_TO_RAD * EARTH_RADIUS_M
+      )
+  );
+}
+
+function NeighborBuildingMesh({
+  ring,
+  heightM,
+  originLon,
+  originLat,
+}: {
+  ring: [number, number][];
+  heightM: number;
+  originLon: number;
+  originLat: number;
+}) {
+  const geometry = useMemo(() => {
+    const pts = projectRingToScene(ring, originLon, originLat);
+    if (pts.length < 3) return null;
+
+    // THREE.Shape attend un contour CCW pour le contour extérieur
+    if (THREE.ShapeUtils.isClockWise(pts)) pts.reverse();
+
+    const shape = new THREE.Shape(pts);
+    const geo = new THREE.ExtrudeGeometry(shape, {
+      depth: Math.max(2, heightM),
+      bevelEnabled: false,
+      steps: 1,
+      curveSegments: 4,
+    });
+
+    // L'extrusion native se fait sur Z → on bascule pour avoir la hauteur sur Y
+    geo.rotateX(-Math.PI / 2);
+    geo.computeVertexNormals();
+    return geo;
+  }, [ring, heightM, originLon, originLat]);
+
+  useEffect(() => {
+    return () => {
+      geometry?.dispose();
+    };
+  }, [geometry]);
+
+  if (!geometry) return null;
+
+  return (
+    <mesh geometry={geometry} castShadow receiveShadow>
+      {/* Gris mat neutre pour ne pas concurrencer visuellement la parcelle principale */}
+      <meshStandardMaterial color="#e2e8f0" roughness={0.88} metalness={0.02} />
+    </mesh>
+  );
+}
+
+function NeighborBuildings({
+  buildings,
+  parcelCenter,
+}: {
+  buildings: NearbyBuilding[];
+  parcelCenter: { lon: number; lat: number };
+}) {
+  if (buildings.length === 0) return null;
+
+  return (
+    <group>
+      {buildings.map((b) => (
+        <NeighborBuildingMesh
+          key={b.id}
+          ring={b.ring}
+          heightM={b.heightM}
+          originLon={parcelCenter.lon}
+          originLat={parcelCenter.lat}
+        />
+      ))}
+    </group>
+  );
+}
+
 // ─── Contenu de la scène (lumières, grille, volume) ────────────────────────────
 
 function SceneContent({
@@ -851,6 +1089,10 @@ function SceneContent({
   mapZoom,
   onCaptureReady,
   buildingGroupRef,
+  facadeColor,
+  facadeTexture,
+  studioTrees,
+  nearbyBuildings,
 }: {
   data: ParcelSceneData | null;
   modifiers: VisualModifiers;
@@ -859,6 +1101,10 @@ function SceneContent({
   mapZoom?: number;
   onCaptureReady?: (capture: () => string | null) => void;
   buildingGroupRef?: React.RefObject<THREE.Group | null>;
+  facadeColor?: string;
+  facadeTexture?: FacadeTexture;
+  studioTrees?: StudioTree[];
+  nearbyBuildings?: NearbyBuilding[];
 }) {
   const controlsRef = useRef<OrbitControlsImpl | null>(null);
 
@@ -1020,6 +1266,14 @@ function SceneContent({
         maxDistance={focus ? Math.max(80, Math.max(focus.width, focus.depth) * 8) : 80}
       />
 
+      {/* Contexte urbain : bâtiments OSM voisins en gris mat */}
+      {nearbyBuildings && nearbyBuildings.length > 0 && data?.parcelCenter ? (
+        <NeighborBuildings
+          buildings={nearbyBuildings}
+          parcelCenter={data.parcelCenter}
+        />
+      ) : null}
+
       {data ? <ParcelBoundaries loops={footprintShape.boundaries} /> : null}
       {data && (data.zoneType === "N" || data.zoneType === "A") ? (
         <ParcelTrees shape={footprintShape} />
@@ -1031,8 +1285,33 @@ function SceneContent({
           footprintShape={footprintShape}
           buildingType={buildingType}
           buildingGroupRef={buildingGroupRef}
+          facadeColor={facadeColor}
+          facadeTexture={facadeTexture}
         />
       ) : null}
+
+      {data ? (
+        <BuildingAnnotations
+          data={data}
+          footprintShape={footprintShape}
+          buildingType={buildingType ?? "collective"}
+        />
+      ) : null}
+
+      {studioTrees && studioTrees.length > 0
+        ? studioTrees.map((tree) => (
+            <LowPolyTree
+              key={tree.id}
+              tree={{
+                x: (footprintShape.center.x) + tree.dx,
+                z: (footprintShape.center.z) + tree.dz,
+                height: 0.6,
+                radius: 0.22,
+                species: "oak",
+              }}
+            />
+          ))
+        : null}
     </>
   );
 }
@@ -1048,8 +1327,16 @@ interface ParcelSceneProps {
   hidePromptInput?: boolean;
   fillContainer?: boolean;
   mapZoom?: number;
-   /** Heure solaire (0–24) pilotée par le dashboard. */
+  /** Heure solaire (0–24) pilotée par le dashboard. */
   sunTime?: number;
+  /** Studio PRO : couleur de façade (hex). Prioritaire sur facadeTexture. */
+  facadeColor?: string;
+  /** Studio PRO : texture de façade. */
+  facadeTexture?: FacadeTexture;
+  /** Studio PRO : arbres ajoutés manuellement (offsets depuis le centre). */
+  studioTrees?: StudioTree[];
+  /** Bâtiments voisins récupérés via OSM pour le contexte urbain. */
+  nearbyBuildings?: NearbyBuilding[];
   onPromptChange?: (prompt: string) => void;
   onCaptureReady?: (capture: () => string | null) => void;
 }
@@ -1065,6 +1352,10 @@ export const ParcelScene = forwardRef<ParcelSceneHandle, ParcelSceneProps>(
       fillContainer = false,
       mapZoom,
       sunTime,
+      facadeColor,
+      facadeTexture,
+      studioTrees,
+      nearbyBuildings,
       onPromptChange,
       onCaptureReady,
     }: ParcelSceneProps,
@@ -1202,6 +1493,10 @@ export const ParcelScene = forwardRef<ParcelSceneHandle, ParcelSceneProps>(
               mapZoom={mapZoom}
               onCaptureReady={handleCaptureReady}
               buildingGroupRef={buildingGroupRef}
+              facadeColor={facadeColor}
+              facadeTexture={facadeTexture}
+              studioTrees={studioTrees}
+              nearbyBuildings={nearbyBuildings}
             />
           </Canvas>
         </div>

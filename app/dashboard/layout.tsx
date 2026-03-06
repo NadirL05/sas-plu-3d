@@ -1,5 +1,9 @@
 import type { ReactNode } from "react";
 import { headers } from "next/headers";
+
+// All dashboard routes are auth-gated and depend on session headers —
+// they must always be server-rendered dynamically, never statically prebuilt.
+export const dynamic = "force-dynamic";
 import { eq } from "drizzle-orm";
 import { auth } from "@/src/lib/auth";
 import { db } from "@/src/db";

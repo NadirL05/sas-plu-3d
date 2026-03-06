@@ -1,8 +1,6 @@
 import OpenAI from "openai";
 import { NextResponse } from "next/server";
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
 export interface AnalyzeZoningResult {
   recommendedHeight: number;
   roofType: "flat" | "sloped";
@@ -15,6 +13,9 @@ export async function POST(req: Request) {
   if (!apiKey) {
     return NextResponse.json({ error: "OPENAI_API_KEY non configurée." }, { status: 500 });
   }
+
+  // Instantiated here (not at module scope) so the build phase never throws
+  const openai = new OpenAI({ apiKey });
 
   let prompt: string;
   let currentMaxHeight: number;
