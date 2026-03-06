@@ -17,6 +17,7 @@ import {
   Html,
   Line,
   OrbitControls,
+  Sky,
 } from "@react-three/drei";
 import { gsap } from "gsap";
 import * as THREE from "three";
@@ -50,6 +51,7 @@ export interface ParcelSceneData {
 
 export interface ParcelSceneHandle {
   exportToObj: () => void;
+  getCanvasImage: () => string | null;
   buildingType?: BuildingType;
 }
 
@@ -343,24 +345,36 @@ interface SunSettings {
   shadowOpacity: number;
 }
 
-function getSunSettings(sunTime: number, center: THREE.Vector3): SunSettings {
+function getSunSettings(
+  sunTime: number,
+  sunMonth: number,
+  center: THREE.Vector3
+): SunSettings {
   const clampedTime = Math.min(20, Math.max(6, sunTime));
+  const clampedMonth = Math.min(12, Math.max(1, sunMonth));
   const dayProgress = (clampedTime - 6) / 14;
-  const altitudeFactor = Math.max(0.12, Math.sin(dayProgress * Math.PI));
+  const dayAltitude = Math.max(0.08, Math.sin(dayProgress * Math.PI));
+
+  // Juin = soleil haut, décembre = soleil bas.
+  const seasonalCycle = Math.cos(((clampedMonth - 6) / 12) * Math.PI * 2);
+  const seasonalFactor = (seasonalCycle + 1) / 2;
+  const altitudeFactor = Math.max(
+    0.06,
+    dayAltitude * THREE.MathUtils.lerp(0.4, 1, seasonalFactor)
+  );
   const azimuth = THREE.MathUtils.lerp(-Math.PI * 0.65, Math.PI * 0.65, dayProgress);
-  const radius = 26;
+  const radius = THREE.MathUtils.lerp(24, 30, seasonalFactor);
 
   return {
     position: [
       center.x + Math.cos(azimuth) * radius,
-      THREE.MathUtils.lerp(6, 24, altitudeFactor),
+      THREE.MathUtils.lerp(4.5, 24, altitudeFactor),
       center.z + Math.sin(azimuth) * radius,
     ],
-    intensity: THREE.MathUtils.lerp(0.42, 1.35, altitudeFactor),
-    shadowOpacity: THREE.MathUtils.lerp(0.68, 0.35, altitudeFactor),
+    intensity: THREE.MathUtils.lerp(0.35, 1.35, altitudeFactor),
+    shadowOpacity: THREE.MathUtils.lerp(0.72, 0.33, altitudeFactor),
   };
 }
-
 function useExtrudedGeometry(shapes: THREE.Shape[], height: number): THREE.ExtrudeGeometry {
   const geometry = useMemo(() => {
     const extrudeHeight = Math.max(height, 0.2);
@@ -1086,6 +1100,7 @@ function SceneContent({
   modifiers,
   buildingType,
   sunTime,
+  sunMonth,
   mapZoom,
   onCaptureReady,
   buildingGroupRef,
@@ -1098,6 +1113,7 @@ function SceneContent({
   modifiers: VisualModifiers;
   buildingType?: BuildingType;
   sunTime: number;
+  sunMonth: number;
   mapZoom?: number;
   onCaptureReady?: (capture: () => string | null) => void;
   buildingGroupRef?: React.RefObject<THREE.Group | null>;
@@ -1131,32 +1147,27 @@ function SceneContent({
     ? Math.max(30, Math.ceil(Math.max(focus.width, focus.depth) * 2.5))
     : 30;
   const sun = useMemo(
-    () => getSunSettings(sunTime, focus?.center ?? new THREE.Vector3(0, 0, 0)),
-    [sunTime, focus?.center]
+    () => getSunSettings(sunTime, sunMonth, focus?.center ?? new THREE.Vector3(0, 0, 0)),
+    [sunTime, sunMonth, focus?.center]
   );
   const ambientIntensity = modifiers.hasPrompt ? 0.33 : 0.35;
 
   function DynamicSun({
-    sunTime,
+    sunPosition,
     focus,
     intensity,
   }: {
-    sunTime: number;
+    sunPosition: [number, number, number];
     focus: SceneFocus | null;
     intensity: number;
   }) {
     const lightRef = useRef<THREE.DirectionalLight | null>(null);
     const targetRef = useRef<THREE.Object3D | null>(null);
 
-    const targetPosition = useMemo(() => {
-      const center = focus?.center ?? new THREE.Vector3(0, 0, 0);
-      const sunAngle = ((sunTime - 6) / 14) * Math.PI;
-      const radius = Math.max(40, Math.max(focus?.width ?? 20, focus?.depth ?? 20) * 1.2);
-      const x = center.x + Math.cos(sunAngle) * -radius;
-      const y = center.y + Math.max(Math.sin(sunAngle) * radius, 8);
-      const z = center.z + Math.sin(sunAngle) * radius;
-      return new THREE.Vector3(x, y, z);
-    }, [sunTime, focus?.center, focus?.width, focus?.depth]);
+    const targetPosition = useMemo(
+      () => new THREE.Vector3(sunPosition[0], sunPosition[1], sunPosition[2]),
+      [sunPosition]
+    );
 
     const targetCenter = useMemo(() => {
       const center = focus?.center ?? new THREE.Vector3(0, 0, 0);
@@ -1225,7 +1236,8 @@ function SceneContent({
 
       <ambientLight intensity={ambientIntensity} />
       <directionalLight position={[18, 22, 10]} intensity={0.35} />
-      <DynamicSun sunTime={sunTime} focus={focus} intensity={sun.intensity} />
+      <DynamicSun sunPosition={sun.position} focus={focus} intensity={sun.intensity} />
+      <Sky sunPosition={sun.position} />
       <Environment preset="city" blur={0.75} />
 
       {data ? (
@@ -1329,6 +1341,8 @@ interface ParcelSceneProps {
   mapZoom?: number;
   /** Heure solaire (0–24) pilotée par le dashboard. */
   sunTime?: number;
+  /** Mois solaire (1–12) piloté par le dashboard. */
+  sunMonth?: number;
   /** Studio PRO : couleur de façade (hex). Prioritaire sur facadeTexture. */
   facadeColor?: string;
   /** Studio PRO : texture de façade. */
@@ -1352,6 +1366,7 @@ export const ParcelScene = forwardRef<ParcelSceneHandle, ParcelSceneProps>(
       fillContainer = false,
       mapZoom,
       sunTime,
+      sunMonth,
       facadeColor,
       facadeTexture,
       studioTrees,
@@ -1395,6 +1410,7 @@ export const ParcelScene = forwardRef<ParcelSceneHandle, ParcelSceneProps>(
       ref,
       () => ({
         exportToObj: handleExportToObj,
+        getCanvasImage: () => captureRef.current?.() ?? null,
         buildingType,
       }),
       [handleExportToObj, buildingType]
@@ -1468,6 +1484,13 @@ export const ParcelScene = forwardRef<ParcelSceneHandle, ParcelSceneProps>(
       return 14;
     }, [sunTime]);
 
+    const effectiveSunMonth = useMemo(() => {
+      if (typeof sunMonth === "number" && Number.isFinite(sunMonth)) {
+        return Math.min(12, Math.max(1, Math.round(sunMonth)));
+      }
+      return 6;
+    }, [sunMonth]);
+
     return (
       <div className={cn("w-full", fillContainer ? "h-full" : "space-y-3")}>
         <div
@@ -1490,6 +1513,7 @@ export const ParcelScene = forwardRef<ParcelSceneHandle, ParcelSceneProps>(
               modifiers={modifiers}
               buildingType={buildingType}
               sunTime={effectiveSunTime}
+              sunMonth={effectiveSunMonth}
               mapZoom={mapZoom}
               onCaptureReady={handleCaptureReady}
               buildingGroupRef={buildingGroupRef}

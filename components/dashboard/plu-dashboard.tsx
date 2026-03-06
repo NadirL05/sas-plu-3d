@@ -2,6 +2,8 @@
 
 import { useState, useCallback, useEffect, useRef } from "react";
 import dynamic from "next/dynamic";
+import html2canvas from "html2canvas";
+import { jsPDF } from "jspdf";
 import {
   AlertCircle,
   AlertTriangle,
@@ -41,6 +43,7 @@ import {
   lookupZoneAction,
   saveProjectAction,
 } from "@/app/actions/plu-actions";
+import { fetchNearbyBuildings, type NearbyBuilding } from "@/src/lib/osm-engine";
 import { computeProfitabilityScore } from "@/src/lib/plu-engine";
 import type {
   AddressSuggestion,
@@ -107,7 +110,20 @@ const MAP_STYLES = {
   satellite: "mapbox://styles/mapbox/satellite-streets-v12",
   wireframe: "mapbox://styles/mapbox/dark-v11",
 } as const;
-
+const MONTH_NAMES_FR = [
+  "Janvier",
+  "Février",
+  "Mars",
+  "Avril",
+  "Mai",
+  "Juin",
+  "Juillet",
+  "Août",
+  "Septembre",
+  "Octobre",
+  "Novembre",
+  "Décembre",
+] as const;
 const MOCK_ZONE_DATA: { zone: ZoneUrba; maxHeight: number } = {
   zone: {
     libelle: "U",
@@ -170,30 +186,6 @@ function buildSyntheticAddressSuggestion(lon: number, lat: number): AddressSugge
   };
 }
 
-function dataURLtoFile(dataurl: string, filename: string): File {
-  const [meta, encoded] = dataurl.split(",");
-  if (!meta || !encoded) {
-    throw new Error("Format data URL invalide.");
-  }
-
-  const mimeMatch = meta.match(/^data:([^;]+);base64$/);
-  if (!mimeMatch) {
-    throw new Error("MIME type introuvable dans la capture.");
-  }
-
-  const mime = mimeMatch[1];
-  const binary = atob(encoded);
-  const bytes = new Uint8Array(binary.length);
-
-  for (let i = 0; i < binary.length; i += 1) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-
-  const extension = mime.includes("jpeg") ? "jpg" : mime.includes("webp") ? "webp" : "png";
-  const fileName = filename.endsWith(`.${extension}`) ? filename : `${filename}.${extension}`;
-
-  return new File([bytes], fileName, { type: mime });
-}
 function buildParcelSceneData(
   zone: ZoneUrba | null | undefined,
   parcel: ParcelPolygon | null,
@@ -303,10 +295,11 @@ export function PLUDashboard({ isAuthenticated = false, isPro = false }: PLUDash
     roofType?: "flat" | "sloped";
     hasCommercialGround?: boolean;
   } | null>(null);
-  const [captureScene, setCaptureScene] = useState<(() => string | null) | null>(null);
   const [mapCenter, setMapCenter] = useState(DEFAULT_MAP_CENTER);
   const [mapZoom, setMapZoom] = useState(14);
   const [sunTime, setSunTime] = useState(14);
+  const [sunMonth, setSunMonth] = useState(6);
+  const [nearbyBuildings, setNearbyBuildings] = useState<NearbyBuilding[]>([]);
   const [buildingType, setBuildingType] = useState<
     "massing" | "house" | "collective" | "mixed"
   >("collective");
@@ -337,6 +330,7 @@ export function PLUDashboard({ isAuthenticated = false, isPro = false }: PLUDash
   const lookupRequestIdRef = useRef(0);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const parcelSceneRef = useRef<ParcelSceneHandle | null>(null);
+  const investorSummaryRef = useRef<HTMLDivElement | null>(null);
   const [currentProjectId, setCurrentProjectId] = useState<string | null>(null);
   const [isPluAnalyzing, setIsPluAnalyzing] = useState(false);
   const [isUploadingPluPdf, setIsUploadingPluPdf] = useState(false);
@@ -444,6 +438,7 @@ export function PLUDashboard({ isAuthenticated = false, isPro = false }: PLUDash
     setIsLoadingZone(true);
     setIsLoadingDvf(true);
     setIsLoadingRisks(true);
+    setNearbyBuildings([]);
 
     const dvfPromise = lookupDvfAction(suggestion.lon, suggestion.lat).catch((error) => {
       console.warn("[DVF_LOOKUP_WARNING]", error);
@@ -455,7 +450,12 @@ export function PLUDashboard({ isAuthenticated = false, isPro = false }: PLUDash
         return null;
       }
     );
-
+    const nearbyBuildingsPromise = fetchNearbyBuildings(suggestion.lat, suggestion.lon).catch(
+      (error) => {
+        console.warn("[OSM_NEARBY_BUILDINGS_WARNING]", error);
+        return [];
+      }
+    );
     try {
       const lookupResult = await lookupZoneAction(suggestion.lon, suggestion.lat);
       if (requestId !== lookupRequestIdRef.current) return;
@@ -495,10 +495,15 @@ export function PLUDashboard({ isAuthenticated = false, isPro = false }: PLUDash
     } finally {
       if (requestId !== lookupRequestIdRef.current) return;
       setIsLoadingZone(false);
-      const [dvfResult, georisquesResult] = await Promise.all([dvfPromise, georisquesPromise]);
+      const [dvfResult, georisquesResult, nearbyResult] = await Promise.all([
+        dvfPromise,
+        georisquesPromise,
+        nearbyBuildingsPromise,
+      ]);
       if (requestId !== lookupRequestIdRef.current) return;
       setDvfSummary(dvfResult);
       setGeorisquesSummary(georisquesResult);
+      setNearbyBuildings(nearbyResult);
       setIsLoadingDvf(false);
       setIsLoadingRisks(false);
     }
@@ -624,7 +629,7 @@ export function PLUDashboard({ isAuthenticated = false, isPro = false }: PLUDash
         setMapError(message);
       });
 
-    return () => {
+  return () => {
       cancelled = true;
       if (moveLookupDebounceRef.current) {
         clearTimeout(moveLookupDebounceRef.current);
@@ -838,96 +843,6 @@ export function PLUDashboard({ isAuthenticated = false, isPro = false }: PLUDash
       });
   }, [currentProjectId]);
 
-  const uploadSceneCapture = useCallback(
-    async (sceneImageDataUrl: string, projectId: string): Promise<string | null> => {
-      const file = dataURLtoFile(sceneImageDataUrl, `scene-${projectId}`);
-      const uploaded = await uploadFiles({
-        endpoint: "sceneCaptureUploader",
-        files: [file],
-      });
-
-      const first = uploaded[0] as { url?: string; ufsUrl?: string } | undefined;
-      return first?.url ?? first?.ufsUrl ?? null;
-    },
-    []
-  );
-  const handleExportReport = useCallback(async () => {
-    if (!selectedAddress || !zone) return;
-
-    const parcelData = buildParcelSceneData(zone, parcel, selectedAddress);
-    if (!parcelData) {
-      toast.error("Impossible de générer un rapport sans données PLU.");
-      return;
-    }
-
-    setIsExporting(true);
-
-    try {
-      const sceneImageDataUrl = captureScene?.() ?? null;
-      const projectId = `${selectedAddress.inseeCode || "projet"}-${Date.now()}`;
-      let sceneImageUrl: string | null = null;
-
-      if (sceneImageDataUrl) {
-        try {
-          sceneImageUrl = await uploadSceneCapture(sceneImageDataUrl, projectId);
-        } catch (uploadError) {
-          console.warn("[SCENE_UPLOAD_WARNING]", uploadError);
-          toast.warning(
-            "Upload externe indisponible, export PDF avec capture locale."
-          );
-        }
-      }
-
-      const response = await fetch("/api/projects/export", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          projectId,
-          address: {
-            label: selectedAddress.label,
-            city: selectedAddress.city,
-            postcode: selectedAddress.postcode,
-            lat: selectedAddress.lat,
-            lon: selectedAddress.lon,
-          },
-          plu: {
-            zone: zone.libelle,
-            typezone: zone.typezone,
-            maxHeight: parcelData.maxHeight,
-            footprint: parcelData.footprint ?? null,
-          },
-          analysisPrompt: scenePrompt,
-          sceneImageUrl,
-          sceneImageDataUrl: sceneImageUrl ? null : sceneImageDataUrl,
-        }),
-      });
-
-      if (!response.ok) {
-        const data = await response.json().catch(() => null);
-        throw new Error(data?.error ?? "Échec de la génération PDF.");
-      }
-
-      const blob = await response.blob();
-      const fileUrl = URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = fileUrl;
-      link.download = `rapport-plu-${projectId}.pdf`;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      URL.revokeObjectURL(fileUrl);
-
-      toast.success("Rapport PDF téléchargé");
-    } catch (error) {
-      const message =
-        error instanceof Error ? error.message : "Erreur lors de l'export du rapport.";
-      toast.error(message);
-      console.error("[EXPORT_REPORT_ERROR]", error);
-    } finally {
-      setIsExporting(false);
-    }
-  }, [captureScene, parcel, scenePrompt, selectedAddress, uploadSceneCapture, zone]);
-
   const baseParcelSceneData = buildParcelSceneData(zone, parcel, selectedAddress);
   const parcelSceneData = baseParcelSceneData
     ? {
@@ -1034,6 +949,181 @@ export function PLUDashboard({ isAuthenticated = false, isPro = false }: PLUDash
           { date: "-", type: "Aucune donnée", surface: "-", price: "-" },
           { date: "-", type: "Aucune donnée", surface: "-", price: "-" },
         ];
+  const generateInvestorReport = useCallback(async () => {
+    if (!selectedAddress || !zone) {
+      toast.error("Données insuffisantes pour générer le rapport investisseur.");
+      return;
+    }
+
+    const parcelData = buildParcelSceneData(zone, parcel, selectedAddress);
+    if (!parcelData) {
+      toast.error("Impossible de générer un rapport sans données PLU.");
+      return;
+    }
+
+    setIsExporting(true);
+
+    try {
+      const pdf = new jsPDF("p", "mm", "a4");
+      const pageWidth = pdf.internal.pageSize.getWidth();
+      const pageHeight = pdf.internal.pageSize.getHeight();
+      const margin = 15;
+      const contentWidth = pageWidth - margin * 2;
+      let y = 18;
+
+      const ensurePageSpace = (neededHeight: number) => {
+        if (y + neededHeight > pageHeight - margin) {
+          pdf.addPage();
+          y = margin;
+        }
+      };
+
+      const writeParagraph = (text: string, fontSize = 10) => {
+        pdf.setFont("helvetica", "normal");
+        pdf.setFontSize(fontSize);
+        const lines = pdf.splitTextToSize(text, contentWidth);
+        const estimatedHeight = lines.length * (fontSize * 0.42 + 1.1);
+        ensurePageSpace(estimatedHeight + 1);
+        pdf.text(lines, margin, y);
+        y += estimatedHeight;
+      };
+
+      pdf.setFont("helvetica", "bold");
+      pdf.setFontSize(16);
+      pdf.text("SAS PLU 3D - Étude de faisabilité", margin, y);
+      y += 7;
+
+      const reportDate = new Intl.DateTimeFormat("fr-FR", {
+        dateStyle: "long",
+      }).format(new Date());
+
+      writeParagraph(`Date : ${reportDate}`);
+      writeParagraph(`Parcelle : ${selectedAddress.label}`);
+      writeParagraph("Rapport Investisseur");
+      y += 2;
+
+      const sceneImageDataUrl = parcelSceneRef.current?.getCanvasImage?.() ?? null;
+
+      if (sceneImageDataUrl) {
+        ensurePageSpace(12);
+        pdf.setFont("helvetica", "bold");
+        pdf.setFontSize(12);
+        pdf.text("Maquette 3D", margin, y);
+        y += 5;
+
+        const imageProps = pdf.getImageProperties(sceneImageDataUrl);
+        const imageWidth = 180;
+        const imageHeight = Math.min(95, (imageWidth * imageProps.height) / imageProps.width);
+        ensurePageSpace(imageHeight + 5);
+        pdf.addImage(sceneImageDataUrl, "PNG", margin, y, imageWidth, imageHeight, undefined, "FAST");
+        y += imageHeight + 6;
+      } else {
+        writeParagraph("Capture 3D indisponible pour cette session.");
+      }
+
+      if (investorSummaryRef.current) {
+        const summaryCanvas = await html2canvas(investorSummaryRef.current, {
+          scale: 1.2,
+          backgroundColor: "#020617",
+          useCORS: true,
+          logging: false,
+        });
+
+        const summaryImage = summaryCanvas.toDataURL("image/png");
+        const summaryHeight = Math.min(
+          100,
+          (contentWidth * summaryCanvas.height) / summaryCanvas.width
+        );
+
+        ensurePageSpace(summaryHeight + 10);
+        pdf.setFont("helvetica", "bold");
+        pdf.setFontSize(12);
+        pdf.text("Synthèse visuelle", margin, y);
+        y += 5;
+        pdf.addImage(summaryImage, "PNG", margin, y, contentWidth, summaryHeight, undefined, "FAST");
+        y += summaryHeight + 6;
+      }
+
+      ensurePageSpace(12);
+      pdf.setFont("helvetica", "bold");
+      pdf.setFontSize(13);
+      pdf.text("Section PLU (IA)", margin, y);
+      y += 6;
+
+      const pluLines = [
+        `Zone : ${zone.libelle || zone.typezone || "-"}`,
+        `Type de zone : ${zone.typezone || "-"}`,
+        `CES : ${pluAnalysisData?.ces ?? `${groundCoveragePct}% (estimation)`}`,
+        `Hauteur max : ${parcelData.maxHeight} m`,
+        `Retrait : ${pluAnalysisData?.retrait ?? `${setbackDistance.toFixed(1)} m (estimation)`}`,
+        `Espaces verts : ${pluAnalysisData?.espacesVerts ?? "Non analysé"}`,
+      ];
+
+      for (const line of pluLines) {
+        writeParagraph(`• ${line}`);
+      }
+
+      const hasFinancialData =
+        financialSdpM2 !== null ||
+        financialMargeNette !== null ||
+        financialCA !== null ||
+        financialCoutTotal !== null;
+
+      if (hasFinancialData) {
+        ensurePageSpace(12);
+        pdf.setFont("helvetica", "bold");
+        pdf.setFontSize(13);
+        pdf.text("Section Bilan", margin, y);
+        y += 6;
+
+        const financialLines = [
+          `Surface de plancher estimée : ${
+            financialSdpM2 !== null ? `${financialSdpM2.toLocaleString("fr-FR")} m²` : "N/A"
+          }`,
+          `Chiffre d'affaires estimé : ${formatCurrency(financialCA)}`,
+          `Coût total estimé : ${formatCurrency(financialCoutTotal)}`,
+          `Marge nette estimée : ${
+            financialMargeNette !== null ? `${(financialMargeNette * 100).toFixed(1)} %` : "N/A"
+          }`,
+        ];
+
+        for (const line of financialLines) {
+          writeParagraph(`• ${line}`);
+        }
+      }
+
+      const safeAddress = selectedAddress.label
+        .slice(0, 10)
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .replace(/[^a-zA-Z0-9-_]/g, "_");
+
+      pdf.save(`Etude_Faisabilite_${safeAddress || "parcelle"}.pdf`);
+      toast.success("Rapport investisseur généré.");
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : "Erreur pendant la génération du rapport investisseur.";
+      toast.error(message);
+      console.error("[INVESTOR_REPORT_ERROR]", error);
+    } finally {
+      setIsExporting(false);
+    }
+  }, [
+    selectedAddress,
+    zone,
+    parcel,
+    pluAnalysisData,
+    groundCoveragePct,
+    setbackDistance,
+    financialSdpM2,
+    financialMargeNette,
+    financialCA,
+    financialCoutTotal,
+  ]);
+
+
   const zoningCardsActive = !!selectedAddress && !isLoadingZone;
 
   return (
@@ -1273,72 +1363,65 @@ export function PLUDashboard({ isAuthenticated = false, isPro = false }: PLUDash
                 fillContainer
                 mapZoom={mapZoom}
                 sunTime={sunTime}
+                sunMonth={sunMonth}
                 className="h-full w-full rounded-none border-0 bg-transparent"
                 promptValue={scenePrompt}
                 hidePromptInput
                 onPromptChange={setScenePrompt}
-                onCaptureReady={(capture) => setCaptureScene(() => capture)}
                 facadeColor={isPro ? facadeColor : undefined}
                 facadeTexture={isPro ? facadeTexture : undefined}
                 studioTrees={isPro ? studioTrees : undefined}
+                nearbyBuildings={nearbyBuildings}
               />
-              <div className="absolute bottom-6 right-6 z-40 premium-glass rounded-xl p-4 flex flex-col gap-3 w-64 shadow-2xl">
-                <div className="flex justify-between items-center">
-                  <span className="text-xs font-bold uppercase tracking-wider text-slate-400">
-                    Ensoleillement
-                  </span>
-                  <span className="text-xs font-bold text-white bg-primary/20 px-2 py-1 rounded-md">
-                    {Math.floor(sunTime)}h{sunTime % 1 !== 0 ? "30" : "00"}
-                  </span>
+              <div className="absolute bottom-6 right-6 z-40 premium-glass rounded-xl p-4 w-72 shadow-2xl">
+                <div className="space-y-3">
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[11px] font-bold uppercase tracking-wider text-slate-400">
+                        Heure solaire
+                      </span>
+                      <span className="rounded-md bg-primary/20 px-2 py-1 text-xs font-bold text-white">
+                        {Math.floor(sunTime)}h{sunTime % 1 !== 0 ? "30" : "00"}
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min={6}
+                      max={20}
+                      step={0.5}
+                      value={sunTime}
+                      onChange={(e) => setSunTime(parseFloat(e.target.value))}
+                      className="h-1 w-full cursor-pointer appearance-none rounded-lg bg-slate-700 accent-primary"
+                      aria-label="Heure solaire (ensoleillement)"
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[11px] font-bold uppercase tracking-wider text-slate-400">
+                        Mois de l&apos;année
+                      </span>
+                      <span className="rounded-md bg-primary/20 px-2 py-1 text-xs font-bold text-white">
+                        {MONTH_NAMES_FR[sunMonth - 1]}
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min={1}
+                      max={12}
+                      step={1}
+                      value={sunMonth}
+                      onChange={(e) => setSunMonth(parseInt(e.target.value, 10))}
+                      className="h-1 w-full cursor-pointer appearance-none rounded-lg bg-slate-700 accent-primary"
+                      aria-label="Mois de l'année (ensoleillement)"
+                    />
+                  </div>
                 </div>
-                <input
-                  type="range"
-                  min={6}
-                  max={20}
-                  step={0.5}
-                  value={sunTime}
-                  onChange={(e) => setSunTime(parseFloat(e.target.value))}
-                  className="w-full h-1 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-primary"
-                  aria-label="Heure solaire (ensoleillement)"
-                />
-              </div>
-            </div>
-            <div className="mt-4 flex flex-col gap-2 px-1 text-[11px] text-slate-300 md:flex-row md:items-center md:justify-between">
-              <div className="space-y-1">
-                <p className="font-semibold uppercase tracking-[0.2em] text-slate-400">
-                  Héliodon
-                </p>
-                <p className="text-xs text-slate-500">
-                  Faites glisser pour simuler la course du soleil autour de la parcelle.
-                </p>
-              </div>
-              <div className="flex flex-1 items-center gap-3 md:justify-end">
-                <div className="relative flex-1 max-w-xs">
-                  <input
-                    type="range"
-                    min={0}
-                    max={24}
-                    step={0.5}
-                    value={sunTime}
-                    onChange={(event) => setSunTime(Number(event.target.value))}
-                    className="h-1.5 w-full cursor-pointer appearance-none rounded-full bg-slate-800/80 accent-primary"
-                    aria-label="Héliodon (heure solaire)"
-                  />
-                </div>
-                <span className="inline-flex items-center rounded-full border border-primary/40 bg-primary/10 px-3 py-1 text-[11px] font-semibold text-primary">
-                  {(() => {
-                    const hours = Math.floor(sunTime);
-                    const minutes = Math.round((sunTime - hours) * 60);
-                    const paddedMinutes = String(minutes).padStart(2, "0");
-                    return `Soleil : ${hours}h${paddedMinutes}`;
-                  })()}
-                </span>
               </div>
             </div>
           </section>
         ) : null}
 
-        <section className="xl:col-start-2 space-y-3 rounded-2xl premium-glass p-4">
+        <section id="investor-report-summary" ref={investorSummaryRef} className="xl:col-start-2 space-y-3 rounded-2xl premium-glass p-4">
           <h2 className="mb-4 flex items-center gap-2 text-lg font-semibold text-white">
             <BarChart3 className="h-5 w-5 text-primary" />
             Zoning Intelligence
@@ -1712,12 +1795,21 @@ export function PLUDashboard({ isAuthenticated = false, isPro = false }: PLUDash
             <h2 className="text-lg font-semibold text-white">Sales History (DVF)</h2>
             <div className="flex items-center gap-2">
               <Button
-                onClick={handleExportReport}
+                onClick={generateInvestorReport}
                 disabled={!zone || isLoadingZone || isExporting}
                 className="gap-2 bg-slate-100 text-slate-900 hover:bg-white"
               >
-                {isExporting ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileDown className="h-4 w-4" />}
-                Download PDF Report
+                {isExporting ? (
+                  <>
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    Génération du PDF en cours...
+                  </>
+                ) : (
+                  <>
+                    <FileDown className="h-4 w-4" />
+                    Télécharger le rapport PDF
+                  </>
+                )}
               </Button>
               <Button
                 onClick={handleExportObj}
@@ -2214,4 +2306,5 @@ export function PLUDashboard({ isAuthenticated = false, isPro = false }: PLUDash
     </div>
   );
 }
+
 
