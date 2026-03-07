@@ -1099,36 +1099,33 @@ function NeighborBuildings({
 // ─── Contenu de la scène (lumières, grille, volume) ────────────────────────────
 
 type GoogleTilesStatus = "idle" | "loading" | "ready" | "error";
-
-function normalizeLoopCounterClockwise(loop: THREE.Vector3[]): THREE.Vector3[] {
-  if (loop.length < 3) return loop;
-
-  let signedArea = 0;
-  for (let i = 0; i < loop.length; i += 1) {
-    const current = loop[i];
-    const next = loop[(i + 1) % loop.length];
-    signedArea += current.x * next.z - next.x * current.z;
-  }
-
-  return signedArea >= 0 ? loop : [...loop].reverse();
-}
+const GOOGLE_TILES_LOAD_TIMEOUT_MS = 12_000;
 
 function buildParcelClipPlanes(loop: THREE.Vector3[]): THREE.Plane[] {
   if (loop.length < 3) return [];
 
-  const normalizedLoop = normalizeLoopCounterClockwise(loop);
+  const centroid = new THREE.Vector3();
+  for (const point of loop) {
+    centroid.add(point);
+  }
+  centroid.multiplyScalar(1 / loop.length);
+
   const planes: THREE.Plane[] = [];
 
-  for (let i = 0; i < normalizedLoop.length; i += 1) {
-    const current = normalizedLoop[i];
-    const next = normalizedLoop[(i + 1) % normalizedLoop.length];
+  for (let i = 0; i < loop.length; i += 1) {
+    const current = loop[i];
+    const next = loop[(i + 1) % loop.length];
     const edge = new THREE.Vector3(next.x - current.x, 0, next.z - current.z);
 
     if (edge.lengthSq() < 1e-8) continue;
 
-    // Outward normal for a CCW loop in XZ plane.
-    const outwardNormal = new THREE.Vector3(edge.z, 0, -edge.x).normalize();
-    const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(outwardNormal, current);
+    const candidateNormal = new THREE.Vector3(edge.z, 0, -edge.x).normalize();
+    const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(candidateNormal, current);
+
+    if (plane.distanceToPoint(centroid) > 0) {
+      plane.negate();
+    }
+
     planes.push(plane);
   }
 
@@ -1161,6 +1158,12 @@ function GooglePhotorealisticTiles({
   useEffect(() => {
     let cancelled = false;
     const tilesGroup = tilesGroupRef.current;
+    const loadTimeout = window.setTimeout(() => {
+      if (!cancelled && !runtimeRef.current) {
+        onStatusChange?.("error");
+      }
+    }, GOOGLE_TILES_LOAD_TIMEOUT_MS);
+
     onStatusChange?.("loading");
 
     Loader3DTiles.load({
@@ -1200,6 +1203,7 @@ function GooglePhotorealisticTiles({
           return;
         }
 
+        window.clearTimeout(loadTimeout);
         runtime.orientToGeocoord({
           long: parcelCenter.lon,
           lat: parcelCenter.lat,
@@ -1215,6 +1219,7 @@ function GooglePhotorealisticTiles({
         onStatusChange?.("ready");
       })
       .catch((error) => {
+        window.clearTimeout(loadTimeout);
         console.warn("[google-tiles] failed, fallback OSM", error);
         onStatusChange?.("error");
       });
@@ -1230,6 +1235,7 @@ function GooglePhotorealisticTiles({
       runtimeRef.current = null;
       modelRef.current = null;
       alignedToTerrainRef.current = false;
+      window.clearTimeout(loadTimeout);
     };
   }, [gl, onStatusChange, parcelCenter.lat, parcelCenter.lon, clippingPlanes, size.height, size.width]);
 
@@ -1317,8 +1323,8 @@ function SceneContent({
   const canUseGoogleTiles = Boolean(
     data?.parcelCenter && GOOGLE_MAPS_API_KEY.trim().length > 0
   );
-  const googleTilesActive = canUseGoogleTiles && googleTilesStatus !== "error";
-  const showOsmFallback = !canUseGoogleTiles || googleTilesStatus === "error";
+  const googleTilesActive = canUseGoogleTiles && googleTilesStatus === "ready";
+  const showOsmFallback = !canUseGoogleTiles || googleTilesStatus !== "ready";
 
   const gridSize = focus
     ? Math.max(30, Math.ceil(Math.max(focus.width, focus.depth) * 2.5))
@@ -1735,5 +1741,4 @@ export const ParcelScene = forwardRef<ParcelSceneHandle, ParcelSceneProps>(
     );
   }
 );
-
 
