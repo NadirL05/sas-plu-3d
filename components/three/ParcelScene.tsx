@@ -27,6 +27,7 @@ import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
 import { getParcelPolygon, type ParcelGeometry } from "@/src/lib/plu-engine";
 import type { NearbyBuilding } from "@/src/lib/osm-engine";
+import { Loader3DTiles, type Runtime as TilesRuntime } from "three-loader-3dtiles";
 
 // ─── Données pour la visualisation 3D ─────────────────────────────────────────
 
@@ -66,6 +67,8 @@ interface ParcelShapeData {
 const DEFAULT_FOOTPRINT = { width: 10, depth: 15 };
 const EARTH_RADIUS_M = 6_378_137;
 const DEG_TO_RAD = Math.PI / 180;
+const GOOGLE_PHOTOREALISTIC_TILES_URL = "https://tile.googleapis.com/v1/3dtiles/root.json";
+const GOOGLE_MAPS_API_KEY = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY ?? "";
 
 type BuildingType = "massing" | "house" | "collective" | "mixed";
 type RoofStyle = "default" | "flat" | "slope";
@@ -1095,6 +1098,173 @@ function NeighborBuildings({
 
 // ─── Contenu de la scène (lumières, grille, volume) ────────────────────────────
 
+type GoogleTilesStatus = "idle" | "loading" | "ready" | "error";
+
+function normalizeLoopCounterClockwise(loop: THREE.Vector3[]): THREE.Vector3[] {
+  if (loop.length < 3) return loop;
+
+  let signedArea = 0;
+  for (let i = 0; i < loop.length; i += 1) {
+    const current = loop[i];
+    const next = loop[(i + 1) % loop.length];
+    signedArea += current.x * next.z - next.x * current.z;
+  }
+
+  return signedArea >= 0 ? loop : [...loop].reverse();
+}
+
+function buildParcelClipPlanes(loop: THREE.Vector3[]): THREE.Plane[] {
+  if (loop.length < 3) return [];
+
+  const normalizedLoop = normalizeLoopCounterClockwise(loop);
+  const planes: THREE.Plane[] = [];
+
+  for (let i = 0; i < normalizedLoop.length; i += 1) {
+    const current = normalizedLoop[i];
+    const next = normalizedLoop[(i + 1) % normalizedLoop.length];
+    const edge = new THREE.Vector3(next.x - current.x, 0, next.z - current.z);
+
+    if (edge.lengthSq() < 1e-8) continue;
+
+    // Outward normal for a CCW loop in XZ plane.
+    const outwardNormal = new THREE.Vector3(edge.z, 0, -edge.x).normalize();
+    const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(outwardNormal, current);
+    planes.push(plane);
+  }
+
+  return planes;
+}
+
+function GooglePhotorealisticTiles({
+  parcelCenter,
+  parcelBoundaries,
+  onStatusChange,
+}: {
+  parcelCenter: { lon: number; lat: number };
+  parcelBoundaries: THREE.Vector3[][];
+  onStatusChange?: (status: GoogleTilesStatus) => void;
+}) {
+  const { gl, size, camera } = useThree();
+  const tilesGroupRef = useRef<THREE.Group | null>(null);
+  const runtimeRef = useRef<TilesRuntime | null>(null);
+  const modelRef = useRef<THREE.Object3D | null>(null);
+  const raycasterRef = useRef(new THREE.Raycaster());
+  const alignedToTerrainRef = useRef(false);
+
+  const outerBoundary = useMemo(() => {
+    const loop = parcelBoundaries[0] ?? [];
+    return loop.map((point) => point.clone());
+  }, [parcelBoundaries]);
+
+  const clippingPlanes = useMemo(() => buildParcelClipPlanes(outerBoundary), [outerBoundary]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const tilesGroup = tilesGroupRef.current;
+    onStatusChange?.("loading");
+
+    Loader3DTiles.load({
+      url: GOOGLE_PHOTOREALISTIC_TILES_URL,
+      viewport: {
+        width: size.width,
+        height: size.height,
+        devicePixelRatio: gl.getPixelRatio(),
+      },
+      renderer: gl,
+      options: {
+        googleApiKey: GOOGLE_MAPS_API_KEY,
+        maximumMemoryUsage: 96,
+        maximumScreenSpaceError: 18,
+        viewDistanceScale: 0.85,
+        contentPostProcess: (content) => {
+          const materialList = Array.isArray(content.material)
+            ? content.material
+            : [content.material];
+
+          for (const material of materialList) {
+            if (!material) continue;
+            const typedMaterial = material as THREE.Material & {
+              clippingPlanes?: THREE.Plane[];
+              clipIntersection?: boolean;
+            };
+            typedMaterial.clippingPlanes = clippingPlanes;
+            typedMaterial.clipIntersection = true;
+            typedMaterial.needsUpdate = true;
+          }
+        },
+      },
+    })
+      .then(({ model, runtime }) => {
+        if (cancelled) {
+          runtime.dispose();
+          return;
+        }
+
+        runtime.orientToGeocoord({
+          long: parcelCenter.lon,
+          lat: parcelCenter.lat,
+          height: 0,
+        });
+
+        alignedToTerrainRef.current = false;
+        runtimeRef.current = runtime;
+        modelRef.current = model;
+
+        model.renderOrder = -2;
+        tilesGroup?.add(model);
+        onStatusChange?.("ready");
+      })
+      .catch((error) => {
+        console.warn("[google-tiles] failed, fallback OSM", error);
+        onStatusChange?.("error");
+      });
+
+    return () => {
+      cancelled = true;
+
+      if (modelRef.current && tilesGroup) {
+        tilesGroup.remove(modelRef.current);
+      }
+
+      runtimeRef.current?.dispose();
+      runtimeRef.current = null;
+      modelRef.current = null;
+      alignedToTerrainRef.current = false;
+    };
+  }, [gl, onStatusChange, parcelCenter.lat, parcelCenter.lon, clippingPlanes, size.height, size.width]);
+
+  useEffect(() => {
+    runtimeRef.current?.setRenderer(gl);
+    runtimeRef.current?.setViewport({
+      width: size.width,
+      height: size.height,
+      devicePixelRatio: gl.getPixelRatio(),
+    });
+  }, [gl, size.height, size.width]);
+
+  useFrame((_, delta) => {
+    if (runtimeRef.current) {
+      runtimeRef.current.update(delta, camera);
+    }
+
+    if (!alignedToTerrainRef.current && modelRef.current) {
+      const raycaster = raycasterRef.current;
+      raycaster.set(new THREE.Vector3(0, 1200, 0), new THREE.Vector3(0, -1, 0));
+      const hits = raycaster.intersectObject(modelRef.current, true);
+
+      if (hits.length > 0) {
+        const terrainY = hits[0]?.point.y;
+        if (typeof terrainY === "number" && Number.isFinite(terrainY)) {
+          modelRef.current.position.y -= terrainY;
+          alignedToTerrainRef.current = true;
+        }
+      }
+    }
+  });
+
+  return <group ref={tilesGroupRef} />;
+}
+
 function SceneContent({
   data,
   modifiers,
@@ -1123,6 +1293,7 @@ function SceneContent({
   nearbyBuildings?: NearbyBuilding[];
 }) {
   const controlsRef = useRef<OrbitControlsImpl | null>(null);
+  const [googleTilesStatus, setGoogleTilesStatus] = useState<GoogleTilesStatus>("idle");
 
   const footprintShape = useMemo(() => {
     return buildShapeData(data?.parcelPolygon, data?.footprint);
@@ -1143,6 +1314,12 @@ function SceneContent({
     };
   }, [data, footprintShape.width, footprintShape.depth, footprintShape.center]);
 
+  const canUseGoogleTiles = Boolean(
+    data?.parcelCenter && GOOGLE_MAPS_API_KEY.trim().length > 0
+  );
+  const googleTilesActive = canUseGoogleTiles && googleTilesStatus !== "error";
+  const showOsmFallback = !canUseGoogleTiles || googleTilesStatus === "error";
+
   const gridSize = focus
     ? Math.max(30, Math.ceil(Math.max(focus.width, focus.depth) * 2.5))
     : 30;
@@ -1150,7 +1327,7 @@ function SceneContent({
     () => getSunSettings(sunTime, sunMonth, focus?.center ?? new THREE.Vector3(0, 0, 0)),
     [sunTime, sunMonth, focus?.center]
   );
-  const ambientIntensity = modifiers.hasPrompt ? 0.33 : 0.35;
+  const ambientIntensity = modifiers.hasPrompt ? 0.3 : 0.33;
 
   function DynamicSun({
     sunPosition,
@@ -1234,11 +1411,26 @@ function SceneContent({
       <ViewportAutoCenter focus={focus} controlsRef={controlsRef} mapZoom={mapZoom} />
       <AutoRotateOnParcelLoad controlsRef={controlsRef} triggerToken={parcelToken} />
 
+      {googleTilesActive ? <fog attach="fog" args={["#dbeafe", 140, 460]} /> : null}
+
       <ambientLight intensity={ambientIntensity} />
-      <directionalLight position={[18, 22, 10]} intensity={0.35} />
-      <DynamicSun sunPosition={sun.position} focus={focus} intensity={sun.intensity} />
+      <directionalLight position={[18, 22, 10]} intensity={googleTilesActive ? 0.28 : 0.35} />
+      <DynamicSun
+        sunPosition={sun.position}
+        focus={focus}
+        intensity={googleTilesActive ? sun.intensity * 0.85 : sun.intensity}
+      />
       <Sky sunPosition={sun.position} />
-      <Environment preset="city" blur={0.75} />
+      <Environment preset="city" blur={googleTilesActive ? 0.35 : 0.75} />
+
+      {canUseGoogleTiles && data?.parcelCenter ? (
+        <GooglePhotorealisticTiles
+          key={`${data.parcelCenter.lat.toFixed(6)}:${data.parcelCenter.lon.toFixed(6)}`}
+          parcelCenter={data.parcelCenter}
+          parcelBoundaries={footprintShape.boundaries}
+          onStatusChange={setGoogleTilesStatus}
+        />
+      ) : null}
 
       {data ? (
         <ContactShadows
@@ -1278,8 +1470,8 @@ function SceneContent({
         maxDistance={focus ? Math.max(80, Math.max(focus.width, focus.depth) * 8) : 80}
       />
 
-      {/* Contexte urbain : bâtiments OSM voisins en gris mat */}
-      {nearbyBuildings && nearbyBuildings.length > 0 && data?.parcelCenter ? (
+      {/* Fallback OSM si Google Tiles indisponible */}
+      {showOsmFallback && nearbyBuildings && nearbyBuildings.length > 0 && data?.parcelCenter ? (
         <NeighborBuildings
           buildings={nearbyBuildings}
           parcelCenter={data.parcelCenter}
@@ -1315,8 +1507,8 @@ function SceneContent({
             <LowPolyTree
               key={tree.id}
               tree={{
-                x: (footprintShape.center.x) + tree.dx,
-                z: (footprintShape.center.z) + tree.dz,
+                x: footprintShape.center.x + tree.dx,
+                z: footprintShape.center.z + tree.dz,
                 height: 0.6,
                 radius: 0.22,
                 species: "oak",
@@ -1505,6 +1697,7 @@ export const ParcelScene = forwardRef<ParcelSceneHandle, ParcelSceneProps>(
             camera={{ position: [12, 8, 12], fov: 45 }}
             gl={{ antialias: true, alpha: true, preserveDrawingBuffer: true }}
             onCreated={({ gl }) => {
+              gl.localClippingEnabled = true;
               gl.setClearColor(0x000000, 0);
             }}
           >
@@ -1542,4 +1735,5 @@ export const ParcelScene = forwardRef<ParcelSceneHandle, ParcelSceneProps>(
     );
   }
 );
+
 
