@@ -10,6 +10,56 @@ import * as schema from "@/src/db/schema";
 const stripeSecretKey = process.env.STRIPE_SECRET_KEY ?? "";
 const stripeWebhookSecret = process.env.STRIPE_WEBHOOK_SECRET ?? "";
 const stripeProPriceId = process.env.STRIPE_PRO_PRICE_ID ?? "";
+const DEFAULT_BASE_URL = "http://localhost:3000";
+
+function normalizeOrigin(value: string | undefined | null): string | null {
+  if (!value) return null;
+
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+
+  const normalizedValue =
+    /^https?:\/\//i.test(trimmed)
+      ? trimmed
+      : trimmed.startsWith("localhost") || trimmed.startsWith("127.0.0.1")
+      ? `http://${trimmed}`
+      : `https://${trimmed}`;
+
+  try {
+    return new URL(normalizedValue).origin;
+  } catch {
+    return null;
+  }
+}
+
+function buildTrustedOrigins() {
+  const origins = new Set<string>();
+
+  const candidates = [
+    process.env.BETTER_AUTH_URL,
+    process.env.NEXT_PUBLIC_APP_URL,
+    process.env.VERCEL_PROJECT_PRODUCTION_URL,
+    process.env.VERCEL_BRANCH_URL,
+    process.env.VERCEL_URL,
+    DEFAULT_BASE_URL,
+    "http://127.0.0.1:3000",
+  ];
+
+  for (const candidate of candidates) {
+    const origin = normalizeOrigin(candidate);
+    if (origin) origins.add(origin);
+  }
+
+  return Array.from(origins);
+}
+
+const authBaseURL =
+  normalizeOrigin(process.env.BETTER_AUTH_URL) ??
+  normalizeOrigin(process.env.NEXT_PUBLIC_APP_URL) ??
+  normalizeOrigin(process.env.VERCEL_PROJECT_PRODUCTION_URL) ??
+  normalizeOrigin(process.env.VERCEL_URL) ??
+  DEFAULT_BASE_URL;
+
 export const STRIPE_BILLING_ENABLED =
   DB_AVAILABLE &&
   stripeSecretKey.length > 0 &&
@@ -75,11 +125,8 @@ const guestAuth = {
 
 export const auth = db
   ? betterAuth({
-      baseURL: process.env.BETTER_AUTH_URL ?? "http://localhost:3000",
-      trustedOrigins: [
-        process.env.BETTER_AUTH_URL ?? "http://localhost:3000",
-        "http://127.0.0.1:3000",
-      ],
+      baseURL: authBaseURL,
+      trustedOrigins: buildTrustedOrigins(),
       database: drizzleAdapter(db, {
         provider: "pg",
         schema: {
