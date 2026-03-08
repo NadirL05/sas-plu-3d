@@ -24,6 +24,9 @@ import { StudyShare } from "@/components/dashboard/study-share";
 import { StudyParcelView } from "@/components/dashboard/study-parcel-view";
 import { ReanalyzeButton } from "@/components/dashboard/reanalyze-button";
 import { StudyFinancialPanel } from "@/components/dashboard/study-financial-panel";
+import { StudyMarketPanel } from "@/components/dashboard/study-market-panel";
+import { StudyAttractivenessPanel } from "@/components/dashboard/study-attractiveness-panel";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { StudyExportButton } from "@/components/dashboard/study-export-button";
 
 function formatCurrency(value?: number | null): string {
@@ -74,6 +77,34 @@ function getRiskBadge(level?: GeorisquesSummary["floodLevel"]) {
         className: "bg-slate-700/60 text-slate-200 border-slate-500/40",
       };
   }
+}
+
+function coverageFor(zoningType?: string | null): number {
+  if (!zoningType) return 0.5;
+  if (zoningType.startsWith("U")) return 0.6;
+  if (zoningType.startsWith("AU")) return 0.5;
+  return 0.3;
+}
+
+function defaultHeight(zoningType?: string | null): number {
+  if (!zoningType) return 9;
+  if (zoningType.startsWith("U")) return 12;
+  if (zoningType.startsWith("AU")) return 10;
+  return 6;
+}
+
+function estimateSdpM2(
+  parcelAreaM2?: number | null,
+  zoningType?: string | null,
+  maxHeightM?: number | null
+): number | null {
+  if (typeof parcelAreaM2 !== "number" || !Number.isFinite(parcelAreaM2) || parcelAreaM2 <= 0) {
+    return null;
+  }
+  const coverageRatio = coverageFor(zoningType);
+  const maxHeight = maxHeightM ?? defaultHeight(zoningType);
+  const floors = Math.max(1, Math.floor(maxHeight / 3));
+  return Math.round(parcelAreaM2 * coverageRatio * floors);
 }
 
 type StudyPageProps = {
@@ -155,6 +186,20 @@ export default async function StudyPage({ params }: StudyPageProps) {
     postcode: "",
     score: 1,
   };
+
+  const studyLat = Number(study.lat);
+  const studyLon = Number(study.lon);
+  const hasStudyCoords = Number.isFinite(studyLat) && Number.isFinite(studyLon);
+
+  const estimatedSdp = estimateSdpM2(
+    parcel?.areaM2 ?? null,
+    zoning?.typezone ?? null,
+    scenarios[0]?.maxHeightM ?? null
+  );
+  const programSdpM2 =
+    typeof promoter?.surfacePlancherM2 === "number" && Number.isFinite(promoter.surfacePlancherM2)
+      ? Math.round(promoter.surfacePlancherM2)
+      : estimatedSdp;
 
   const inondationBadge = getRiskBadge(risks?.floodLevel);
   const argileBadge = getRiskBadge(risks?.clayLevel);
@@ -475,12 +520,51 @@ export default async function StudyPage({ params }: StudyPageProps) {
           </CardContent>
         </Card>
       </section>
+      <Tabs defaultValue="financial" className="w-full">
+        <TabsList className="grid h-auto w-full grid-cols-3 rounded-xl border border-border/70 bg-slate-950/80 p-1">
+          <TabsTrigger
+            value="financial"
+            className="text-xs font-semibold data-[state=active]:bg-white/10 data-[state=active]:text-white"
+          >
+            Bilan
+          </TabsTrigger>
+          <TabsTrigger
+            value="market"
+            className="text-xs font-semibold data-[state=active]:bg-white/10 data-[state=active]:text-white"
+          >
+            Marché
+          </TabsTrigger>
+          <TabsTrigger
+            value="attractiveness"
+            className="text-xs font-semibold data-[state=active]:bg-white/10 data-[state=active]:text-white"
+          >
+            Programme & Quartier
+          </TabsTrigger>
+        </TabsList>
 
-      <StudyFinancialPanel
-        parcelAreaM2={parcel?.areaM2 ?? null}
-        zoningType={zoning?.typezone ?? null}
-        maxHeightM={scenarios[0]?.maxHeightM ?? null}
-      />
+        <TabsContent value="financial" className="mt-2">
+          <StudyFinancialPanel
+            parcelAreaM2={parcel?.areaM2 ?? null}
+            zoningType={zoning?.typezone ?? null}
+            maxHeightM={scenarios[0]?.maxHeightM ?? null}
+          />
+        </TabsContent>
+
+        <TabsContent value="market" className="mt-2">
+          <StudyMarketPanel
+            lat={hasStudyCoords ? studyLat : null}
+            lon={hasStudyCoords ? studyLon : null}
+          />
+        </TabsContent>
+
+        <TabsContent value="attractiveness" className="mt-2">
+          <StudyAttractivenessPanel
+            lat={hasStudyCoords ? studyLat : null}
+            lon={hasStudyCoords ? studyLon : null}
+            sdp={programSdpM2 ?? null}
+          />
+        </TabsContent>
+      </Tabs>
 
       <StudyScenariosSection studyId={study.id} initialScenarios={mappedScenarios} />
     </main>

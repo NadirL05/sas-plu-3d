@@ -1,10 +1,11 @@
 /**
- * OSM Engine — récupération des bâtiments voisins via l'API Overpass
+ * OSM Engine — récupération des bâtiments et POI via l'API Overpass
  *
  * Stratégie :
- *  1. Query Overpass pour tous les `way["building"]` dans un rayon donné
+ *  1. Query Overpass pour les bâtiments dans un rayon donné
  *  2. Extraction de la hauteur depuis tags.height ou tags["building:levels"]
  *  3. Retour des anneaux polygonaux en [lon, lat] prêts pour la projection
+ *  4. Query Overpass POI pour transports / écoles / commerces
  */
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -21,12 +22,25 @@ export interface NearbyBuilding {
   heightM: number;
 }
 
+export interface NearbyPOISummary {
+  schools: number;
+  transit: number;
+  shops: number;
+}
+
+type OsmElement = {
+  type: string;
+  id: number;
+  tags?: Record<string, string>;
+  geometry?: Array<{ lat: number; lon: number }>;
+};
+
 // ─── Constantes ───────────────────────────────────────────────────────────────
 
 const OVERPASS_URL = "https://overpass-api.de/api/interpreter";
-const DEFAULT_HEIGHT_M = 6;          // 2 étages si aucune donnée dispo
-const LEVELS_TO_METERS = 3;          // 1 niveau ≈ 3 m
-const MAX_BUILDINGS = 80;            // plafond de performance WebGL
+const DEFAULT_HEIGHT_M = 6; // 2 étages si aucune donnée dispo
+const LEVELS_TO_METERS = 3; // 1 niveau ≈ 3 m
+const MAX_BUILDINGS = 80; // plafond de performance WebGL
 const FETCH_TIMEOUT_MS = 14_000;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -78,13 +92,6 @@ export async function fetchNearbyBuildings(
     throw new Error(`[osm-engine] Overpass API a répondu ${res.status}`);
   }
 
-  type OsmElement = {
-    type: string;
-    id: number;
-    tags?: Record<string, string>;
-    geometry?: Array<{ lat: number; lon: number }>;
-  };
-
   const { elements = [] } = (await res.json()) as { elements: OsmElement[] };
 
   const buildings: NearbyBuilding[] = [];
@@ -94,7 +101,8 @@ export async function fetchNearbyBuildings(
     if (el.type !== "way" || !el.geometry || el.geometry.length < 4) continue;
 
     const ring: [number, number][] = el.geometry.map(
-      ({ lon, lat }) => [lon, lat] as [number, number]
+      ({ lon: buildingLon, lat: buildingLat }) =>
+        [buildingLon, buildingLat] as [number, number]
     );
 
     buildings.push({
@@ -108,4 +116,70 @@ export async function fetchNearbyBuildings(
   }
 
   return buildings;
+}
+
+/**
+ * Récupère un résumé des points d'intérêt autour d'une coordonnée.
+ *
+ * - Transports : public_transport + bus_stop
+ * - Écoles : school + kindergarten
+ * - Commerces : supermarket + bakery
+ */
+export async function fetchNearbyPOIs(
+  lat: number,
+  lon: number,
+  radiusMeters = 800
+): Promise<NearbyPOISummary> {
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+    return { schools: 0, transit: 0, shops: 0 };
+  }
+
+  const query = `[out:json][timeout:12];
+(
+  node["public_transport"](around:${radiusMeters},${lat},${lon});
+  node["highway"="bus_stop"](around:${radiusMeters},${lat},${lon});
+  node["amenity"="school"](around:${radiusMeters},${lat},${lon});
+  node["amenity"="kindergarten"](around:${radiusMeters},${lat},${lon});
+  node["shop"="supermarket"](around:${radiusMeters},${lat},${lon});
+  node["shop"="bakery"](around:${radiusMeters},${lat},${lon});
+);
+out body;`;
+
+  const res = await fetch(OVERPASS_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: `data=${encodeURIComponent(query)}`,
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+  });
+
+  if (!res.ok) {
+    throw new Error(`[osm-engine] Overpass API a répondu ${res.status}`);
+  }
+
+  const { elements = [] } = (await res.json()) as { elements: OsmElement[] };
+
+  const transitIds = new Set<number>();
+  const schoolIds = new Set<number>();
+  const shopIds = new Set<number>();
+
+  for (const el of elements) {
+    if (el.type !== "node") continue;
+    const tags = el.tags ?? {};
+
+    if (tags["public_transport"] || tags["highway"] === "bus_stop") {
+      transitIds.add(el.id);
+    }
+    if (tags["amenity"] === "school" || tags["amenity"] === "kindergarten") {
+      schoolIds.add(el.id);
+    }
+    if (tags["shop"] === "supermarket" || tags["shop"] === "bakery") {
+      shopIds.add(el.id);
+    }
+  }
+
+  return {
+    schools: schoolIds.size,
+    transit: transitIds.size,
+    shops: shopIds.size,
+  };
 }
