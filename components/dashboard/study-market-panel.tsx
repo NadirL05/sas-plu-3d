@@ -88,7 +88,8 @@ export function StudyMarketPanel({ lat, lon }: StudyMarketPanelProps) {
     [sales]
   );
 
-  const isMockSource = sales.length > 0 && sales.every((sale) => sale.source === "mock");
+  const emptyMarketMessage =
+    "Aucune transaction récente trouvée dans ce rayon pour estimer le marché.";
 
   return (
     <section className="space-y-3">
@@ -116,7 +117,7 @@ export function StudyMarketPanel({ lat, lon }: StudyMarketPanelProps) {
             </div>
           </div>
         ) : error ? (
-          <p className="text-xs text-red-300">{error}</p>
+          <p className="text-xs text-slate-400">{emptyMarketMessage}</p>
         ) : (
           <>
             <div className="grid gap-3 sm:grid-cols-2">
@@ -141,12 +142,6 @@ export function StudyMarketPanel({ lat, lon }: StudyMarketPanelProps) {
               </div>
             </div>
 
-            {isMockSource ? (
-              <p className="text-[11px] text-amber-300/80">
-                Données API DVF indisponibles en direct: affichage d&apos;un jeu mock réaliste (MVP).
-              </p>
-            ) : null}
-
             <div className="rounded-xl border border-white/[0.08] bg-white/[0.03] p-3">
               <div className="mb-2 flex items-center gap-2">
                 <BarChart3 className="h-3.5 w-3.5 text-slate-400" />
@@ -170,7 +165,7 @@ export function StudyMarketPanel({ lat, lon }: StudyMarketPanelProps) {
                     {latestSales.length === 0 ? (
                       <tr>
                         <td colSpan={5} className="px-3 py-4 text-center text-slate-500">
-                          Aucune mutation exploitable trouvée.
+                          {error ?? emptyMarketMessage}
                         </td>
                       </tr>
                     ) : (
